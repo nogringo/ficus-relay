@@ -9,6 +9,30 @@ config:
     desc: "Accept and serve kind 1059 gift wraps whose p-tag is the virtual relay's owner, even though their signer is outside the universe"
     default: true
 
+  - name: banyan__owners__enabled
+    desc: "Let each person manage their own virtual relay (pins, blocks, weights and circle sizes) through the admin API and the /admin page"
+    default: true
+  - name: banyan__owners__maxPrimaryCircleSize
+    desc: "Largest primary circle a person can set on their own relay"
+    default: 100
+  - name: banyan__owners__maxSecondaryPerPeer
+    desc: "Largest secondaryPerPeer a person can set on their own relay"
+    default: 20
+  - name: banyan__owners__maxPinned
+    desc: "Maximum number of people a person can pin on their own relay"
+    default: 200
+
+  - name: banyan__threads__maxEvents
+    desc: "Maximum number of events a thread filter ({\"thread\": [id]}) follows, root included (0 disables thread filters)"
+    default: 10000
+
+  - name: banyan__prune__enabled
+    desc: "Regularly delete events that no virtual relay serves and the trust engine does not read"
+    default: false
+  - name: banyan__prune__intervalSeconds
+    desc: "How often the pruning runs, when enabled"
+    default: 86400
+
   - name: banyan__trust__recomputeIntervalSeconds
     desc: "How often each person's trust universe is recomputed"
     default: 3600
@@ -73,3 +97,16 @@ config:
   - name: banyan__harvester__replanIntervalSeconds
     desc: "How often the harvester recomputes which relays to use"
     default: 60
+  - name: banyan__harvester__auth
+    desc: "Answer NIP-42 AUTH challenges from other relays, with a key generated and stored in the database"
+    default: true
+  - name: banyan__harvester__allowPrivateAddresses
+    desc: "Let the harvester connect to relays on private, loopback or link-local addresses (tests and private networks)"
+    default: false
+
+  - name: banyan__distributor__enabled
+    desc: "Send the events of a universe to the inbox relays (NIP-65 read relays) of the universe members they mention"
+    default: true
+  - name: banyan__distributor__maxAgeSeconds
+    desc: "Only events newer than this are sent to inbox relays"
+    default: 86400

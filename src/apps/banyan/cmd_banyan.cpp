@@ -8,6 +8,7 @@
 #include "Tenants.h"
 #include "TrustEngine.h"
 #include "BanyanHttp.h"
+#include "Pruner.h"
 
 
 static const char USAGE[] =
@@ -19,9 +20,11 @@ R"(
       banyan show <person>
       banyan set <person> <settingsJson>
       banyan recompute <person>
+      banyan prune [--dry-run]
 
     <person> is a slug, an npub or a hex pubkey.
     <settingsJson> is a JSON object, for example '{"pinned":["npub1..."],"minScore":1}'.
+    prune deletes the events no virtual relay serves and the trust engine does not read.
 )";
 
 
@@ -84,5 +87,9 @@ void cmd_banyan(const std::vector<std::string> &subArgs) {
         for (const auto &m : members) {
             std::cout << banyan::circleName(m.circle) << " " << banyan::toNpub(m.pubkey) << " " << m.score << "\n";
         }
+    } else if (args["prune"].asBool()) {
+        bool dryRun = args["--dry-run"].asBool();
+        auto r = banyan::pruneEvents(dryRun);
+        std::cout << (dryRun ? "Would delete " : "Deleted ") << r.deleted << " of " << r.scanned << " events whose author is in no universe\n";
     }
 }

@@ -20,6 +20,9 @@ struct PeerEngagement {
     std::array<double, numEngagementTypes> in{};  // peer -> seed
 };
 
+// Kinds read as engagement, zap receipts included
+bool isEngagementKind(uint64_t kind);
+
 // Only peers with engagement in both directions, since the others always score zero
 std::vector<PeerEngagement> computeEngagement(const Bytes32 &seed, uint64_t now);
 

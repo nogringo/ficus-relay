@@ -135,6 +135,12 @@ tables:
       - name: authoredBackfilledAt
       - name: inboxBackfilledAt
 
+  ## Banyan: key the harvester signs NIP-42 AUTH with on other relays (single entry)
+  HarvesterKey:
+    fields:
+      - name: secretKey
+        type: ubytes
+
 tablesRaw:
   ## Raw nostr event JSON, possibly compressed
   ## keys are levIds

@@ -4,6 +4,41 @@
 #include "golpe.h"
 
 #include "jsonParseUtils.h"
+#include "Bytes32.h"
+
+
+// {"thread": [ids]} matches those events and, recursively, every event that references one of them
+// through an e tag, or through an a tag for addressable events. It grows as replies are found.
+struct ThreadState : NonCopyable {
+    std::vector<std::string> roots;
+    flat_hash_set<Bytes32> nodes; // roots and every event reached
+    flat_hash_set<std::string> coords; // "kind:pubkey:d" of the addressable events reached
+    uint64_t maxNodes = 0;
+    bool expanded = false;
+
+    bool full() const {
+        return nodes.size() >= maxNodes;
+    }
+
+    bool addNode(std::string_view id) {
+        if (full()) return false;
+        return nodes.insert(Bytes32(id)).second;
+    }
+
+    bool contains(const PackedEventView &ev) const {
+        if (nodes.contains(Bytes32(ev.id()))) return true;
+
+        bool found = false;
+
+        ev.foreachTag([&](char tagName, std::string_view tagVal){
+            if (tagName == 'e' && tagVal.size() == 32) found = nodes.contains(Bytes32(tagVal));
+            else if (tagName == 'a') found = coords.contains(std::string(tagVal));
+            return !found;
+        });
+
+        return found;
+    }
+};
 
 
 struct FilterSetBytes : NonCopyable {
@@ -114,6 +149,7 @@ struct NostrFilter : NonCopyable {
     std::optional<FilterSetBytes> authors;
     std::optional<FilterSetUint> kinds;
     flat_hash_map<char, FilterSetBytes> tags;
+    std::shared_ptr<ThreadState> thread;
 
     uint64_t since = 0;
     uint64_t until = MAX_U64;
@@ -193,6 +229,26 @@ struct NostrFilter : NonCopyable {
                 } catch (std::exception &e) {
                     throw herr("error parsing ", k, ": ", e.what());
                 }
+            } else if (k == "thread") {
+                checkArray();
+                if (cfg().banyan__threads__maxEvents == 0) throw herr("thread filters are disabled");
+                if (v.get_array().size() == 0) {
+                    neverMatch = true;
+                    continue;
+                }
+                numMajorFields++;
+
+                try {
+                    FilterSetBytes roots(v, true, 32, 32);
+                    thread = std::make_shared<ThreadState>();
+                    thread->maxNodes = std::max<uint64_t>(cfg().banyan__threads__maxEvents, roots.size());
+                    for (size_t i = 0; i < roots.size(); i++) {
+                        thread->roots.push_back(roots.at(i));
+                        thread->nodes.insert(Bytes32(roots.at(i)));
+                    }
+                } catch (std::exception &e) {
+                    throw herr("error parsing thread: ", e.what());
+                }
             } else if (k == "since") {
                 since = jsonGetUnsigned(v, "error parsing since");
             } else if (k == "until") {
@@ -208,7 +264,7 @@ struct NostrFilter : NonCopyable {
 
         if (limit > maxFilterLimit) limit = maxFilterLimit;
 
-        indexOnlyScans = (numMajorFields <= 1) || (numMajorFields == 2 && authors && kinds);
+        indexOnlyScans = !thread && ((numMajorFields <= 1) || (numMajorFields == 2 && authors && kinds));
     }
 
     bool doesMatchTimes(uint64_t created) const {
@@ -225,6 +281,7 @@ struct NostrFilter : NonCopyable {
         if (ids && !ids->doesMatch(ev.id())) return false;
         if (authors && !authors->doesMatch(ev.pubkey())) return false;
         if (kinds && !kinds->doesMatch(ev.kind())) return false;
+        if (thread && !thread->contains(ev)) return false;
 
         for (const auto &[tag, filt] : tags) {
             bool foundMatch = false;
@@ -244,7 +301,7 @@ struct NostrFilter : NonCopyable {
     }
 
     bool isFullDbQuery() {
-        return !ids && !authors && !kinds && tags.size() == 0;
+        return !ids && !authors && !kinds && tags.size() == 0 && !thread;
     }
 };
 
@@ -354,8 +411,10 @@ struct FilterValidator : NonCopyable {
                     hasValidETag = eTagIt->second.size() == 1;
                 }
 
+                if (filter.thread && filter.thread->roots.size() == 1) hasValidETag = true;
+
                 if (!hasValidAuthor && !hasValidPTag && !hasValidETag) {
-                    throw herr("filter must have exactly one author, p tag, or e tag");
+                    throw herr("filter must have exactly one author, p tag, e tag or thread");
                 }
             }
         }

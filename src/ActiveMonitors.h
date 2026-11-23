@@ -7,6 +7,7 @@
 #include "Bytes32.h"
 #include "Subscription.h"
 #include "filters.h"
+#include "ThreadFilter.h"
 
 
 
@@ -85,13 +86,20 @@ struct ActiveMonitors : NonCopyable {
         conns.erase(connId);
     }
 
+    // cb may also receive older events for one subscription: replies a thread filter only reaches through this event
     void process(lmdb::txn &txn, defaultDb::environment::View_Event &ev, const std::function<void(RecipientList &&, uint64_t)> &cb) {
         RecipientList recipients;
+        std::vector<std::pair<NostrFilter*, Monitor*>> threadMatches;
 
         auto processMonitorSet = [&](MonitorSet &ms){
             for (auto &[f, item] : ms) {
-                if (item.latestEventId >= ev.primaryKeyId || item.mon->sub.latestEventId >= ev.primaryKeyId) continue;
+                if (item.latestEventId >= ev.primaryKeyId) continue;
                 item.latestEventId = ev.primaryKeyId;
+
+                // A thread grows through all its events, also those its other fields leave out or another filter already sent
+                if (f->thread && f->thread->contains(PackedEventView(ev.buf))) threadMatches.emplace_back(f, item.mon);
+
+                if (item.mon->sub.latestEventId >= ev.primaryKeyId) continue;
 
                 if (f->doesMatch(PackedEventView(ev.buf))) {
                     recipients.emplace_back(item.mon->sub.connId, item.mon->sub.subId);
@@ -123,8 +131,23 @@ struct ActiveMonitors : NonCopyable {
 
         processMonitorSet(allOthers);
 
+        // After the lookups: growing a thread inserts into the maps they iterate
+        std::vector<std::pair<Monitor*, uint64_t>> lateEvents;
+
+        for (auto &[f, m] : threadMatches) {
+            absorbIntoThread(txn, *f->thread, m->sub.scope.get(), packed, ev.primaryKeyId,
+                [&](char tagName, std::string_view tagVal){ installTagLookup(f, m, tagName, tagVal, ev.primaryKeyId); },
+                [&](uint64_t levId, const PackedEventView &late){ if (f->doesMatch(late)) lateEvents.emplace_back(m, levId); });
+        }
+
         if (recipients.size()) {
             cb(std::move(recipients), ev.primaryKeyId);
+        }
+
+        for (auto &[m, levId] : lateEvents) {
+            RecipientList one;
+            one.emplace_back(m->sub.connId, m->sub.subId);
+            cb(std::move(one), levId);
         }
     }
 
@@ -140,9 +163,31 @@ struct ActiveMonitors : NonCopyable {
         return &f2->second;
     }
 
+    void installTagLookup(NostrFilter *f, Monitor *m, char tagName, std::string_view tagVal, uint64_t currEventId) {
+        auto &tagSpec = getTagSpec(tagName, tagVal);
+        auto res = allTags.try_emplace(tagSpec);
+        res.first->second.try_emplace(f, MonitorItem{m, currEventId});
+    }
+
+    void uninstallTagLookup(NostrFilter *f, char tagName, std::string_view tagVal) {
+        auto &tagSpec = getTagSpec(tagName, tagVal);
+        auto it = allTags.find(tagSpec);
+        if (it == allTags.end()) return;
+        it->second.erase(f);
+        if (it->second.empty()) allTags.erase(it);
+    }
+
     void installLookups(Monitor *m, uint64_t currEventId) {
         for (auto &f : m->sub.filterGroup.filters) {
-            if (f.ids) {
+            if (f.thread) {
+                // Roots by id, in case they arrive after the subscription, and every node by what replies to it
+                for (const auto &id : f.thread->roots) {
+                    auto res = allIds.try_emplace(Bytes32(id));
+                    res.first->second.try_emplace(&f, MonitorItem{m, currEventId});
+                }
+                for (const auto &node : f.thread->nodes) installTagLookup(&f, m, 'e', node.sv(), currEventId);
+                for (const auto &coord : f.thread->coords) installTagLookup(&f, m, 'a', coord, currEventId);
+            } else if (f.ids) {
                 for (size_t i = 0; i < f.ids->size(); i++) {
                     auto res = allIds.try_emplace(Bytes32(f.ids->at(i)));
                     res.first->second.try_emplace(&f, MonitorItem{m, currEventId});
@@ -173,7 +218,16 @@ struct ActiveMonitors : NonCopyable {
 
     void uninstallLookups(Monitor *m) {
         for (auto &f : m->sub.filterGroup.filters) {
-            if (f.ids) {
+            if (f.thread) {
+                for (const auto &id : f.thread->roots) {
+                    auto it = allIds.find(Bytes32(id));
+                    if (it == allIds.end()) continue;
+                    it->second.erase(&f);
+                    if (it->second.empty()) allIds.erase(it);
+                }
+                for (const auto &node : f.thread->nodes) uninstallTagLookup(&f, 'e', node.sv());
+                for (const auto &coord : f.thread->coords) uninstallTagLookup(&f, 'a', coord);
+            } else if (f.ids) {
                 for (size_t i = 0; i < f.ids->size(); i++) {
                     Bytes32 id(f.ids->at(i));
                     auto &monSet = allIds.at(id);

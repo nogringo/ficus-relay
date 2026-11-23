@@ -28,9 +28,21 @@ Writes (`EVENT`) are accepted only when they would be visible: authored by a uni
 
 NIP-42 AUTH checks the path: the `relay` tag must name this virtual relay (`wss://relay.example.com/alice` or its npub form), so a signature for one virtual relay never opens another.
 
-`GET /<slug>` with `Accept: application/nostr+json` returns a NIP-11 document for that virtual relay. Without it, a small landing page shows the relay URL.
+`GET /<slug>` with `Accept: application/nostr+json` returns a NIP-11 document for that virtual relay. Without it, a small landing page shows the relay URL and links the owner to the management page.
 
 WebSocket connections on `/` and on unknown paths get a `NOTICE` and are closed. Over HTTP, `/` keeps strfry's landing page and NIP-11 and also receives the admin API calls, `/admin` serves the admin page, and `/metrics` is unchanged.
+
+### Thread filters
+
+The article asks for a thread in one request instead of recursive filters or the `root` tag hack. A filter can carry a `thread` key with event ids:
+
+    ["REQ", "t", {"thread": ["<event id>"]}]
+
+It matches those events and, recursively, every event that references one of them: through an `e` tag (replies, NIP-22 comments, reactions, reposts, zap receipts), or through an `a` tag when the event is addressable, so comments on an article are found by its address. Any id works as a root, so a sub-thread is asked for the same way. The other filter fields narrow what is sent (`{"thread": [id], "kinds": [1]}` returns the replies without the reactions), and `limit` keeps the newest events of the thread.
+
+The subscription stays open like any other: a new reply to any event of the thread is sent, and becomes part of the thread. Harvested backfills arrive newest first, so a reply can be stored before its parent; when the parent arrives, the replies already waiting for it are sent too. A narrowed subscription still grows through the events it does not send.
+
+On a virtual relay, a thread only grows through events of the universe: a friend's answer to a stranger's reply is not reached through that reply. A thread follows at most `banyan.threads.maxEvents` events (10,000 by default, 0 refuses thread filters). `COUNT` and `NEG-OPEN` accept thread filters too. With `relay.filterValidation.requireAuthorOrTag`, a thread with one root counts like an `e` tag.
 
 ### Trust machine
 
@@ -68,7 +80,17 @@ Pubkeys without a known relay list are looked up on `banyan.harvester.bootstrapR
 
 On each relay, the harvester opens live subscriptions (`since: now`) and pages backward through history (`until` pagination, `banyan.harvester.backfillDays` on the first run). Progress is stored per pubkey in the `HarvestState` table, so a restart only fetches what is new. Events are checked against the filter that requested them and their signatures are verified before being written.
 
-uWS resolves DNS and, on macOS, connects with blocking calls, so every relay is first probed on worker threads (DNS plus a TCP connect with a 5 second timeout). Dead relays back off exponentially up to 30 minutes. Relays on private, loopback, link-local or reserved addresses are skipped, both as written in relay lists and once the probe has resolved them.
+uWS resolves DNS and, on macOS, connects with blocking calls, so every relay is first probed on worker threads (DNS plus a TCP connect with a 5 second timeout). Dead relays back off exponentially up to 30 minutes. Relays on private, loopback, link-local or reserved addresses are skipped, both as written in relay lists and once the probe has resolved them (`banyan.harvester.allowPrivateAddresses` lifts this, for tests and private networks).
+
+#### NIP-42 AUTH
+
+Relays that require NIP-42 get an answer: the harvester signs the `kind:22242` event with its own key, generated on the first start and stored in the `HarvesterKey` table, so other relays always see the same pubkey. It is shown in `harveststatus` and on the admin page, to whitelist it on paid or private relays. A REQ or an event refused with `auth-required:` waits for the AUTH result and is sent again once it succeeds. A relay that refuses the AUTH, or asks for it without a challenge within 30 seconds, is treated as before: the refused requests are dropped and the error shows in the status. `banyan.harvester.auth = false` turns this off.
+
+#### Inbox delivery
+
+The harvester also distributes, as the article's outbox model suggests. When an event is stored, from a client or from the harvester, and its author is in a universe, it is sent to the NIP-65 read relays of the members of that universe it mentions (`p` tags). Only mentions count: replies, reposts, reactions, comments, highlights and articles (kinds 1, 6, 7, 16, 1111, 9802, 30023), not follow or mute lists. People outside the author's universe get nothing, and an event is not sent back to a relay the harvester received it from.
+
+Delivery starts from the relay's start and covers events newer than `banyan.distributor.maxAgeSeconds` (one day by default). It reuses the harvester's connections, and opens at most 20 others, closed after two minutes without work. Each relay gets at most 20 events in flight and 1,000 waiting. `harveststatus` counts the delivered events per relay. `banyan.distributor.enabled = false` turns it off.
 
 The loop that makes a Banyan grow:
 
@@ -79,6 +101,18 @@ The loop that makes a Banyan grow:
 5. The trust machine finds the secondary circle, whose notes are then fetched.
 
 On a first run seeded with a well-connected npub and `backfillDays = 60`, this reached about 145 people and 190k events from 31 relays in three minutes.
+
+### Pruning
+
+Events stay in the database when no virtual relay serves them, because the trust machine may need them. Pruning deletes the others, and keeps:
+
+* everything authored by someone in a universe, and by the people blocked or hidden behind a blocked member, so unblocking stays immediate;
+* gift wraps for an owner;
+* engagement the trust machine reads: events of an engagement kind, within `banyan.trust.windowDays`, that mention (`p`) the owner, a pinned person or a primary member of some universe, blocked ones included, and zap receipts that name one of them as sender (`P`).
+
+So what goes is the history of people who left every universe, and what strangers published without mentioning a seed. When someone's history is pruned, their harvester progress is reset, so if they come back into a universe their history is fetched again.
+
+Pruning is off by default, since it deletes data: `banyan.prune.enabled = true` runs it 10 minutes after the start, then every `banyan.prune.intervalSeconds`. `strfry banyan prune --dry-run` tells what would go. With no virtual relay at all, nothing is pruned. It scans the pubkey index and skips each kept author with one seek, and deletes in batches of 10,000 so writes are not blocked for long.
 
 ## Setup
 
@@ -104,19 +138,21 @@ Run `make` as usual: the `banyan` app is part of `APPS`. The full list of settin
 
 ## Admin API
 
-The admin page uses a NIP-86 style JSON-RPC endpoint: `POST /` with `Content-Type: application/nostr+json+rpc` and a NIP-98 `Authorization` header (kind 27235, `u` = `https://<host>/`, `method` = `POST`, `payload` = sha256 of the body). Responses are `{"result": ...}` or `{"error": "..."}`, with status 401 for a bad signature and 403 for a pubkey that is not in `banyan.admins`. Calls run on their own thread, off the WebSocket event loop.
+The admin page uses a NIP-86 style JSON-RPC endpoint: `POST /` with `Content-Type: application/nostr+json+rpc` and a NIP-98 `Authorization` header (kind 27235, `u` = `https://<host>/`, `method` = `POST`, `payload` = sha256 of the body). Responses are `{"result": ...}` or `{"error": "..."}`, with status 401 for a bad signature and 403 for a pubkey that may not make that call. Calls run on their own thread, off the WebSocket event loop.
+
+Owners manage their own relay with the same API and the same page, signing with their own key: `listtenants` returns only their relay, and `gettenant`, `updatetenant` and `recomputetrust` only accept it. They can change weights, circle sizes, the minimum score, pins and blocks, within the server's limits (`banyan.owners.maxPrimaryCircleSize`, `maxSecondaryPerPeer`, `maxPinned`), since everyone shares one harvester. Only admins add or remove people, change a slug or see the harvester. `banyan.owners.enabled = false` keeps the API admin-only.
 
 | Method | Params | Result |
 |---|---|---|
 | `supportedmethods` | | method names |
-| `whoami` | | `{ pubkey, isAdmin }` (any signer) |
+| `whoami` | | `{ pubkey, isAdmin, tenant }`, plus `ownerLimits` for an owner (any signer) |
 | `listtenants` | | summaries |
 | `addtenant` | `[pubkey, slug]` | summary |
 | `removetenant` | `[person]` | `true` |
 | `gettenant` | `[person]` | summary, settings, members with circle, score, `via`, name and picture |
 | `updatetenant` | `[person, patch]` | detail. `patch` keys: `slug`, `weights` (`reply`, `repost`, `reaction`, `zap`, `mention`), `primaryCircleSize`, `secondaryPerPeer`, `minScore`, `pinned`, `blocked` |
 | `recomputetrust` | `[person]` | `true`, runs in the background |
-| `harveststatus` | | targets and per-relay connection, subscriptions, events received, last error |
+| `harveststatus` | | targets, AUTH pubkey, events delivered, and per relay: connection, AUTH state, subscriptions, events received and delivered, last error |
 
 `person` is a slug, an npub or a hex pubkey. Stored settings only hold what was changed, so the config defaults keep applying to the rest.
 
@@ -129,21 +165,20 @@ strfry banyan remove <person>
 strfry banyan show <person>
 strfry banyan set <person> '{"pinned":["npub1..."]}'
 strfry banyan recompute <person>
+strfry banyan prune [--dry-run]
 ```
 
 A running relay picks up CLI changes within 5 seconds.
 
 ## Tests
 
-`test/tests/banyanTest.js` covers path routing, scoped reads, writes and live events, gift wraps, AUTH bound to the path, per-relay NIP-11, the admin API with NIP-98, and the trust circles on a small engagement graph, including forged and duplicated zap receipts, one-sided floods and blocked members freeing their slot. It needs [nak](https://github.com/fiatjaf/nak) on `PATH` to generate keys and sign events, and runs as part of `test/runTests.sh`. The other test suites run with `banyan.enabled = false`.
+`test/tests/banyanTest.js` covers path routing, scoped reads, writes and live events, gift wraps, AUTH bound to the path, per-relay NIP-11, the admin API with NIP-98, owners managing their own relay, the trust circles on a small engagement graph (including forged and duplicated zap receipts, one-sided floods and blocked members freeing their slot), thread filters (stored, live, out of order, through an article's address), and pruning. A last phase restarts the relay with the harvester pointed at a fake upstream relay that refuses everything before NIP-42 AUTH, and checks that the harvester authenticates, fetches, and delivers a reply to the inbox of the person it mentions. It needs [nak](https://github.com/fiatjaf/nak) on `PATH` to generate keys and sign events, and runs as part of `test/runTests.sh`. The other test suites run with `banyan.enabled = false`. The relay's logs are left in `strfry-banyan-tests/relay.log` under the system temp directory.
 
 ## Not done yet
 
-* Graph queries from the article, such as subscribing to a whole thread in one request.
-* Sending events to the inbox relays of the people they mention (the distribution side of the outbox model).
-* Pruning events that are in no universe. They are trust evidence today, so they stay.
-* NIP-42 AUTH towards upstream relays: relays that require it are skipped.
-* Letting owners manage their own virtual relay (pins, blocks, weights) through the API.
+* Muting a thread or a sub-thread, the other half of the article's thread queries.
+* Sending events written to a virtual relay to their author's own write relays. Delivery only covers the inboxes of the people they mention.
+* NIP-42 AUTH with the owner's key, for relays that only let the owner read their own data: the harvester has one key for the whole server.
 * Weighting zaps by amount.
 * Checking zap receipts against the recipient's LNURL `nostrPubkey`: a signed zap request proves who meant to zap whom, not that the invoice was paid.
 * Connecting to the address the probe checked: uWS resolves the host again, so a DNS answer that changes in between (rebinding) is not caught.

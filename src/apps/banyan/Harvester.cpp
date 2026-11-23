@@ -14,6 +14,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <openssl/rand.h>
+#include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
+#include <secp256k1_schnorrsig.h>
 #include <hoytech/time.h>
 #include <hoytech/hex.h>
 #include <uWebSockets/src/uWS.h>
@@ -32,15 +36,27 @@ namespace banyan {
 
 
 static const std::vector<uint64_t> inboxKinds = { 1, 6, 7, 16, 1111, 9735, 9802, 30023 };
+// Mentions worth delivering: p tags of follow lists, mute lists and the like are not mentions
+static const std::vector<uint64_t> deliveredKinds = { 1, 6, 7, 16, 1111, 9802, 30023 };
 static const uint64_t reqTimeoutSeconds = 60;
 static const uint64_t maxPagesPerChain = 1000;
 static const uint64_t maxFiltersPerLiveReq = 10;
 static const uint64_t maxFutureSeconds = 900;
 
+static const uint64_t authTimeoutSeconds = 30;
+static const uint64_t maxDeliveryOnlyRelays = 20;
+static const uint64_t maxOutboxPerRelay = 1000;
+static const uint64_t maxInflightDeliveries = 20;
+static const uint64_t deliveryTimeoutSeconds = 30;
+static const uint64_t deliveryIdleSeconds = 120;
+static const uint64_t maxEventsDistributedPerTick = 2000;
+static const uint64_t seenOnSeconds = 600;
+static const size_t maxSeenOn = 200'000;
+
 
 static std::atomic<bool> wakeRequested = true;
 static std::mutex statusMutex;
-static tao::json::value statusJson = tao::json::value({ { "targets", 0 }, { "relays", tao::json::empty_array } });
+static tao::json::value statusJson = tao::json::value({ { "targets", 0 }, { "relays", tao::json::empty_array }, { "authPubkey", tao::json::null } });
 
 void harvesterWake() {
     wakeRequested = true;
@@ -104,7 +120,7 @@ static std::string normalizeHarvestUrl(std::string_view input) {
     if (url.find_first_of(" \t\"'<>") != std::string::npos) return "";
 
     auto parts = parseRelayUrl(url);
-    if (isPrivateHost(parts.host)) return "";
+    if (!cfg().banyan__harvester__allowPrivateAddresses && isPrivateHost(parts.host)) return "";
 
     std::string output = scheme + parts.host;
     if (parts.path.size()) output += "/" + parts.path;
@@ -153,7 +169,7 @@ static ProbeResult probeTcp(const std::string &url, int timeoutMs) {
     if (getaddrinfo(host.c_str(), port.c_str(), &hints, &result) != 0) return ProbeResult::Unreachable;
 
     // Same address uWS will use: the first one
-    if (isPrivateAddress(result->ai_addr)) {
+    if (!cfg().banyan__harvester__allowPrivateAddresses && isPrivateAddress(result->ai_addr)) {
         freeaddrinfo(result);
         return ProbeResult::PrivateAddress;
     }
@@ -221,6 +237,79 @@ struct Prober {
     std::vector<std::pair<std::string, ProbeResult>> takeResults() {
         std::lock_guard<std::mutex> guard(mutex);
         return std::move(results);
+    }
+};
+
+
+// Signs NIP-42 AUTH events. Stored in the database so other relays always see the same pubkey.
+struct UpstreamKey {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair keypair;
+    std::string pubkey;
+
+    UpstreamKey() {
+        std::string sk = loadOrCreate();
+        if (!secp256k1_keypair_create(ctx, &keypair, (const uint8_t*)sk.data())) throw herr("invalid harvester key");
+
+        secp256k1_xonly_pubkey xonly;
+        secp256k1_keypair_xonly_pub(ctx, &xonly, nullptr, &keypair);
+        pubkey.resize(32);
+        secp256k1_xonly_pubkey_serialize(ctx, (uint8_t*)pubkey.data(), &xonly);
+    }
+
+    std::string loadOrCreate() {
+        {
+            auto txn = env.txn_ro();
+            std::string found;
+            env.foreach_HarvesterKey(txn, [&](auto &view){
+                found = std::string(view.secretKey());
+                return false;
+            });
+            if (found.size() == 32 && secp256k1_ec_seckey_verify(ctx, (const uint8_t*)found.data())) return found;
+        }
+
+        std::string sk(32, '\0');
+        do {
+            if (RAND_bytes((uint8_t*)sk.data(), 32) != 1) throw herr("unable to generate the harvester key");
+        } while (!secp256k1_ec_seckey_verify(ctx, (const uint8_t*)sk.data()));
+
+        auto txn = env.txn_rw();
+        std::vector<uint64_t> old;
+        env.foreach_HarvesterKey(txn, [&](auto &view){
+            old.push_back(view.primaryKeyId);
+            return true;
+        });
+        for (auto id : old) env.delete_HarvesterKey(txn, id);
+        env.insert_HarvesterKey(txn, sk);
+        txn.commit();
+
+        return sk;
+    }
+
+    tao::json::value sign(uint64_t kind, tao::json::value tags, std::string content) {
+        tao::json::value ev = tao::json::value({
+            { "pubkey", to_hex(pubkey) },
+            { "created_at", hoytech::curr_time_s() },
+            { "kind", kind },
+            { "tags", std::move(tags) },
+            { "content", std::move(content) },
+        });
+
+        auto id = nostrHash(ev);
+
+        uint8_t aux[32], sig[64];
+        if (RAND_bytes(aux, sizeof(aux)) != 1) throw herr("unable to get randomness");
+
+#ifdef SECP256K1_SCHNORRSIG_EXTRAPARAMS_INIT
+        bool ok = secp256k1_schnorrsig_sign32(ctx, sig, (const uint8_t*)id.sv().data(), &keypair, aux);
+#else
+        bool ok = secp256k1_schnorrsig_sign(ctx, sig, (const uint8_t*)id.sv().data(), &keypair, aux);
+#endif
+        if (!ok) throw herr("signing failed");
+
+        ev["id"] = to_hex(id.sv());
+        ev["sig"] = to_hex(std::string_view((const char*)sig, sizeof(sig)));
+        return ev;
     }
 };
 
@@ -320,6 +409,26 @@ struct ActiveReq {
     uint64_t startedAt = 0;
 };
 
+enum class AuthState { None, Wanted, Sent, Ok, Failed };
+
+static std::string_view authStateName(AuthState s) {
+    switch (s) {
+        case AuthState::None: return "none";
+        case AuthState::Wanted: return "wanted";
+        case AuthState::Sent: return "sent";
+        case AuthState::Ok: return "ok";
+        case AuthState::Failed: return "failed";
+    }
+    return "?";
+}
+
+struct Delivery {
+    std::string id; // hex
+    std::string json;
+    uint64_t createdAt = 0;
+    uint64_t sentAt = 0;
+};
+
 struct Relay {
     std::string url;
     uWS::WebSocket<uWS::CLIENT> *ws = nullptr;
@@ -338,6 +447,43 @@ struct Relay {
 
     uint64_t eventsReceived = 0;
     std::string lastError;
+
+    // NIP-42: what the relay refused before AUTH is replayed once it succeeds
+    AuthState authState = AuthState::None;
+    std::string authChallenge;
+    std::string authEventId;
+    uint64_t authSentAt = 0;
+    std::vector<ReqSpec> authRetry;
+    bool authRetryLive = false;
+
+    // Events sent to this relay because it is an inbox of someone they mention
+    std::deque<Delivery> outbox;
+    flat_hash_map<std::string, Delivery> inflight;
+    flat_hash_set<std::string> deliveryIds;
+    uint64_t delivered = 0;
+    uint64_t deliveryRejected = 0;
+    uint64_t lastDeliveryAt = 0;
+
+    bool hasDeliveryWork() const {
+        return outbox.size() || inflight.size();
+    }
+
+    bool deliveryOnly() const {
+        return assignment == Assignment{};
+    }
+
+    void resetSession() {
+        active.clear();
+        queue.clear();
+        authState = AuthState::None;
+        authChallenge.clear();
+        authEventId.clear();
+        authRetry.clear();
+        authRetryLive = false;
+
+        for (auto &[id, d] : inflight) outbox.push_front(std::move(d));
+        inflight.clear();
+    }
 };
 
 
@@ -353,10 +499,32 @@ struct Harvester {
     uint64_t lastPlanAt = 0;
     uint64_t lastSnapshotVersion = 0;
 
+    std::optional<UpstreamKey> key;
+
+    // Distribution: the inbox relays of each universe member, and where harvested events already are
+    struct SeenOn {
+        uint64_t at = 0;
+        std::vector<std::string> urls;
+    };
+
+    flat_hash_map<Bytes32, std::vector<std::string>> deliveryRelays;
+    flat_hash_map<Bytes32, SeenOn> seenOn;
+    std::optional<uint64_t> distributedUpTo;
+    uint64_t deliveredTotal = 0;
+    uint64_t lastHousekeepingAt = 0;
+    Decompressor decomp;
+
     Harvester() {
         writer.verifyTime = false; // relay lists and profiles are often older than events.rejectEventsOlderThanSeconds
         writer.verboseReject = []{ return false; };
         writer.verboseCommit = []{ return false; };
+
+        try {
+            key.emplace();
+            LI << "Banyan harvester: NIP-42 AUTH as " << toNpub(Bytes32(key->pubkey));
+        } catch (std::exception &e) {
+            LE << "Banyan harvester: no key for NIP-42 AUTH: " << e.what();
+        }
 
         group = hub.createGroup<uWS::CLIENT>(uWS::PERMESSAGE_DEFLATE | uWS::SLIDING_DEFLATE_WINDOW);
 
@@ -386,8 +554,7 @@ struct Harvester {
                 if (now < r.connectedAt + 60) r.failures++;
                 else r.failures = 0;
                 r.ws = nullptr;
-                r.active.clear();
-                r.queue.clear();
+                r.resetSession();
                 r.nextAttemptAt = now + backoffSeconds(r.failures);
                 LI << "Banyan harvester: disconnected from " << r.url << " (" << code << ")";
             }
@@ -573,6 +740,7 @@ struct Harvester {
         };
 
         for (const auto &spec : r.queue) collect(spec);
+        for (const auto &spec : r.authRetry) collect(spec);
         for (const auto &[subId, req] : r.active) {
             for (const auto &spec : req.specs) collect(spec);
         }
@@ -607,18 +775,237 @@ struct Harvester {
         enqueueMissingWork(r);
         openLiveReqs(r);
         pump(r);
+        pumpOutbox(r);
     }
 
-    void refreshAssignment(Relay &r) {
+    void closeLiveReqs(Relay &r) {
         std::vector<std::string> liveSubs;
         for (const auto &[subId, req] : r.active) {
             if (req.specs[0].live) liveSubs.push_back(subId);
         }
         for (const auto &subId : liveSubs) closeReq(r, subId);
+    }
 
+    void refreshAssignment(Relay &r) {
+        closeLiveReqs(r);
         enqueueMissingWork(r);
         openLiveReqs(r);
         pump(r);
+    }
+
+
+    bool authEnabled() {
+        return key && cfg().banyan__harvester__auth;
+    }
+
+    void sendAuth(Relay &r) {
+        if (!authEnabled() || r.authChallenge.empty() || !r.ws) return;
+
+        tao::json::value ev;
+
+        try {
+            ev = key->sign(22242, tao::json::value::array({
+                tao::json::value::array({ "relay", r.url }),
+                tao::json::value::array({ "challenge", r.authChallenge }),
+            }), "");
+        } catch (std::exception &e) {
+            r.lastError = std::string("unable to sign AUTH: ") + e.what();
+            return;
+        }
+
+        r.authEventId = ev.at("id").get_string();
+        r.authState = AuthState::Sent;
+        r.authSentAt = hoytech::curr_time_s();
+        send(r, tao::json::value::array({ "AUTH", ev }));
+    }
+
+    // The relay refused something until we authenticate. Returns false when AUTH can't help.
+    bool deferUntilAuth(Relay &r) {
+        if (!authEnabled() || r.authState == AuthState::Ok || r.authState == AuthState::Failed) return false;
+
+        if (r.authState == AuthState::None) {
+            r.authState = AuthState::Wanted;
+            r.authSentAt = hoytech::curr_time_s();
+            sendAuth(r);
+        }
+
+        return true;
+    }
+
+    void authDone(Relay &r, bool ok, const std::string &reason) {
+        r.authEventId.clear();
+
+        if (!ok) {
+            r.authState = AuthState::Failed;
+            r.lastError = "AUTH refused: " + reason;
+            r.authRetry.clear();
+            r.authRetryLive = false;
+            LI << "Banyan harvester: " << r.url << " refused our AUTH: " << reason;
+            pumpOutbox(r);
+            return;
+        }
+
+        r.authState = AuthState::Ok;
+        LI << "Banyan harvester: authenticated to " << r.url;
+
+        for (auto it = r.authRetry.rbegin(); it != r.authRetry.rend(); ++it) r.queue.push_front(std::move(*it));
+        r.authRetry.clear();
+
+        if (r.authRetryLive) {
+            r.authRetryLive = false;
+            closeLiveReqs(r);
+            openLiveReqs(r);
+        }
+
+        pump(r);
+        pumpOutbox(r);
+    }
+
+
+    void pumpOutbox(Relay &r) {
+        if (!r.ws || r.authState == AuthState::Wanted || r.authState == AuthState::Sent) return;
+
+        uint64_t now = hoytech::curr_time_s();
+        uint64_t maxAge = cfg().banyan__distributor__maxAgeSeconds;
+
+        while (r.outbox.size() && r.inflight.size() < maxInflightDeliveries) {
+            auto d = std::move(r.outbox.front());
+            r.outbox.pop_front();
+
+            if (d.createdAt + maxAge < now) {
+                r.deliveryIds.erase(d.id);
+                continue;
+            }
+
+            std::string msg = "[\"EVENT\"," + d.json + "]";
+            r.ws->send(msg.data(), msg.size(), uWS::OpCode::TEXT);
+
+            d.sentAt = now;
+            std::string id = d.id;
+            r.inflight.emplace(std::move(id), std::move(d));
+        }
+    }
+
+    void deliveryDone(Relay &r, const std::string &id, bool ok, const std::string &reason) {
+        auto it = r.inflight.find(id);
+        if (it == r.inflight.end()) return;
+
+        auto d = std::move(it->second);
+        r.inflight.erase(it);
+        r.lastDeliveryAt = hoytech::curr_time_s();
+
+        if (ok || reason.starts_with("duplicate:")) {
+            r.delivered++;
+            deliveredTotal++;
+            r.deliveryIds.erase(d.id);
+        } else if (reason.starts_with("auth-required:") && deferUntilAuth(r)) {
+            r.outbox.push_front(std::move(d));
+        } else {
+            r.deliveryRejected++;
+            r.deliveryIds.erase(d.id);
+            r.lastError = "event refused: " + reason;
+        }
+
+        pumpOutbox(r);
+    }
+
+    size_t numDeliveryOnlyRelays() {
+        return std::count_if(relays.begin(), relays.end(), [](const auto &p){ return p.second.deliveryOnly(); });
+    }
+
+    void queueDelivery(const std::string &url, const std::string &id, const std::string &json, uint64_t createdAt, size_t &deliveryOnlyCount) {
+        auto it = relays.find(url);
+
+        if (it == relays.end()) {
+            if (deliveryOnlyCount >= maxDeliveryOnlyRelays) return;
+            deliveryOnlyCount++;
+            it = relays.try_emplace(url).first;
+            it->second.url = url;
+        }
+
+        auto &r = it->second;
+        if (!r.deliveryIds.insert(id).second) return;
+
+        if (r.outbox.size() >= maxOutboxPerRelay) {
+            r.deliveryIds.erase(r.outbox.front().id);
+            r.outbox.pop_front();
+        }
+
+        r.outbox.push_back(Delivery{ id, json, createdAt, 0 });
+        r.lastDeliveryAt = hoytech::curr_time_s();
+        pumpOutbox(r);
+    }
+
+    // The distribution side of the outbox model: events reach the inbox relays of the universe members they mention
+    void distribute(uint64_t now) {
+        if (!cfg().banyan__distributor__enabled) {
+            distributedUpTo.reset();
+            return;
+        }
+
+        auto txn = env.txn_ro();
+        uint64_t latest = getMostRecentLevId(txn);
+
+        // Starts from now: history is already where its authors put it
+        if (!distributedUpTo || *distributedUpTo > latest) {
+            distributedUpTo = latest;
+            return;
+        }
+
+        if (latest == *distributedUpTo) return;
+
+        auto snap = TenantRegistry::get();
+        uint64_t maxAge = cfg().banyan__distributor__maxAgeSeconds;
+        uint64_t minCreated = now > maxAge ? now - maxAge : 0;
+        uint64_t processed = 0;
+        size_t deliveryOnlyCount = numDeliveryOnlyRelays();
+
+        env.foreach_Event(txn, [&](auto &ev){
+            if (processed++ >= maxEventsDistributedPerTick) return false;
+            distributedUpTo = ev.primaryKeyId;
+
+            PackedEventView packed(ev.buf);
+            if (std::find(deliveredKinds.begin(), deliveredKinds.end(), packed.kind()) == deliveredKinds.end()) return true;
+            if (packed.created_at() < minCreated || packed.created_at() > now + maxFutureSeconds) return true;
+
+            Bytes32 author(packed.pubkey());
+            std::vector<Bytes32> mentioned;
+
+            packed.foreachTag([&](char tagName, std::string_view tagVal){
+                if (tagName == 'p' && tagVal.size() == 32 && Bytes32(tagVal) != author) mentioned.emplace_back(tagVal);
+                return true;
+            });
+
+            if (mentioned.empty()) return true;
+
+            flat_hash_set<Bytes32> recipients;
+
+            for (const auto &t : snap->tenants) {
+                if (!t->universe.contains(author)) continue;
+                for (const auto &pk : mentioned) {
+                    if (t->universe.contains(pk)) recipients.insert(pk);
+                }
+            }
+
+            if (recipients.empty()) return true;
+
+            auto seen = seenOn.find(Bytes32(packed.id()));
+            std::string id = to_hex(packed.id());
+            std::string json;
+
+            for (const auto &pk : recipients) {
+                auto it = deliveryRelays.find(pk);
+                if (it == deliveryRelays.end()) continue;
+
+                for (const auto &url : it->second) {
+                    if (seen != seenOn.end() && std::find(seen->second.urls.begin(), seen->second.urls.end(), url) != seen->second.urls.end()) continue;
+                    if (json.empty()) json = std::string(getEventJson(txn, decomp, ev.primaryKeyId));
+                    queueDelivery(url, id, json, packed.created_at(), deliveryOnlyCount);
+                }
+            }
+
+            return true;
+        }, false, *distributedUpTo + 1);
     }
 
 
@@ -684,11 +1071,19 @@ struct Harvester {
 
             PackedEventView packed(packedStr);
             if (!req.compiled.doesMatch(packed)) return;
-            if (packed.created_at() > hoytech::curr_time_s() + maxFutureSeconds) return;
+            uint64_t now = hoytech::curr_time_s();
+            if (packed.created_at() > now + maxFutureSeconds) return;
 
             req.received++;
             if (packed.created_at() < req.oldest) req.oldest = packed.created_at();
             r.eventsReceived++;
+
+            if (cfg().banyan__distributor__enabled && packed.created_at() + cfg().banyan__distributor__maxAgeSeconds >= now
+                    && std::find(deliveredKinds.begin(), deliveredKinds.end(), packed.kind()) != deliveredKinds.end()) {
+                auto &seen = seenOn[Bytes32(packed.id())];
+                if (!seen.at) seen.at = now;
+                if (std::find(seen.urls.begin(), seen.urls.end(), r.url) == seen.urls.end()) seen.urls.push_back(r.url);
+            }
 
             writer.write({ evJson });
         } else if (type == "EOSE") {
@@ -718,9 +1113,33 @@ struct Harvester {
         } else if (type == "CLOSED") {
             auto it = r.active.find(arr[1].get_string());
             if (it == r.active.end()) return;
-            r.lastError = arr.size() >= 3 && arr[2].is_string() ? arr[2].get_string() : "closed by relay";
+            std::string reason = arr.size() >= 3 && arr[2].is_string() ? arr[2].get_string() : "closed by relay";
+
+            if (reason.starts_with("auth-required:") && deferUntilAuth(r)) {
+                auto specs = std::move(it->second.specs);
+                r.active.erase(it);
+
+                if (specs[0].live) r.authRetryLive = true;
+                else for (auto &spec : specs) r.authRetry.push_back(std::move(spec));
+
+                pump(r);
+                return;
+            }
+
+            r.lastError = reason;
             r.active.erase(it);
             pump(r);
+        } else if (type == "AUTH") {
+            if (!arr[1].is_string()) return;
+            r.authChallenge = arr[1].get_string();
+            if (r.authState != AuthState::Failed && r.authState != AuthState::Sent) sendAuth(r);
+        } else if (type == "OK" && arr.size() >= 3 && arr[1].is_string()) {
+            const auto &id = arr[1].get_string();
+            bool ok = arr[2].is_boolean() && arr[2].get_boolean();
+            std::string reason = arr.size() >= 4 && arr[3].is_string() ? arr[3].get_string() : "";
+
+            if (id == r.authEventId) authDone(r, ok, reason);
+            else deliveryDone(r, id, ok, reason);
         } else if (type == "NOTICE") {
             r.lastError = arr[1].is_string() ? arr[1].get_string() : "notice";
         }
@@ -774,6 +1193,12 @@ struct Harvester {
             if (sorted.size() > cfg().banyan__harvester__relaysPerPubkey) sorted.resize(cfg().banyan__harvester__relaysPerPubkey);
             return sorted;
         };
+
+        deliveryRelays.clear();
+        for (const auto &[pk, seed] : targets) {
+            const auto &rl = lists[pk];
+            if (rl.read.size()) deliveryRelays[pk] = pick(rl.read);
+        }
 
         std::map<std::string, Assignment> plan;
 
@@ -850,7 +1275,18 @@ struct Harvester {
                 continue;
             }
 
-            if (it->second.ws) it->second.ws->close();
+            // Out of the plan, but still delivering: it stays until its outbox is empty
+            auto &r = it->second;
+            if (r.hasDeliveryWork()) {
+                if (!r.deliveryOnly()) {
+                    r.assignment = Assignment{};
+                    if (r.ws) refreshAssignment(r);
+                }
+                ++it;
+                continue;
+            }
+
+            if (r.ws) r.ws->close();
             it = relays.erase(it);
         }
 
@@ -900,10 +1336,59 @@ struct Harvester {
             }
         }
 
+        try {
+            distribute(now);
+        } catch (std::exception &e) {
+            LE << "Banyan harvester: distribution failed: " << e.what();
+        }
+
+        bool housekeeping = now >= lastHousekeepingAt + 60;
+        if (housekeeping) {
+            lastHousekeepingAt = now;
+            if (seenOn.size() > maxSeenOn) seenOn.clear();
+            for (auto it = seenOn.begin(); it != seenOn.end(); ) {
+                if (it->second.at + seenOnSeconds < now) seenOn.erase(it++);
+                else ++it;
+            }
+        }
+
+        for (auto it = relays.begin(); it != relays.end(); ) {
+            auto &r = it->second;
+
+            if (r.deliveryOnly() && !r.hasDeliveryWork() && now > r.lastDeliveryAt + deliveryIdleSeconds && !r.probing) {
+                if (r.ws) r.ws->close();
+                it = relays.erase(it);
+                continue;
+            }
+
+            if (housekeeping && !r.ws) {
+                uint64_t maxAge = cfg().banyan__distributor__maxAgeSeconds;
+                std::erase_if(r.outbox, [&](const Delivery &d){
+                    if (d.createdAt + maxAge >= now) return false;
+                    r.deliveryIds.erase(d.id);
+                    return true;
+                });
+            }
+
+            ++it;
+        }
+
         for (auto &[url, r] : relays) {
             if (!r.ws && !r.connecting && !r.probing && now >= r.nextAttemptAt) {
                 r.probing = true;
                 prober.submit(url);
+            }
+
+            if (r.ws && (r.authState == AuthState::Sent || r.authState == AuthState::Wanted) && now > r.authSentAt + authTimeoutSeconds) {
+                authDone(r, false, r.authState == AuthState::Sent ? "no answer" : "auth-required, but no challenge was sent");
+            }
+
+            if (r.ws && r.inflight.size()) {
+                std::vector<std::string> expired;
+                for (const auto &[id, d] : r.inflight) {
+                    if (now > d.sentAt + deliveryTimeoutSeconds) expired.push_back(id);
+                }
+                for (const auto &id : expired) deliveryDone(r, id, false, "no answer");
             }
 
             if (r.ws) {
@@ -934,6 +1419,10 @@ struct Harvester {
                 { "authors", r.assignment.authors.size() },
                 { "inboxTargets", r.assignment.inbox.size() },
                 { "eventsReceived", r.eventsReceived },
+                { "auth", std::string(authStateName(r.authState)) },
+                { "delivered", r.delivered },
+                { "deliveryQueue", r.outbox.size() + r.inflight.size() },
+                { "deliveryRejected", r.deliveryRejected },
                 { "lastError", r.lastError.size() ? tao::json::value(r.lastError) : tao::json::value(tao::json::null) },
             }));
         }
@@ -942,6 +1431,8 @@ struct Harvester {
         statusJson = tao::json::value({
             { "targets", targets.size() },
             { "relays", std::move(relaysJson) },
+            { "delivered", deliveredTotal },
+            { "authPubkey", key ? tao::json::value(to_hex(key->pubkey)) : tao::json::value(tao::json::null) },
         });
     }
 

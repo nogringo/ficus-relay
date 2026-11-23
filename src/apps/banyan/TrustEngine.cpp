@@ -27,6 +27,11 @@ static const uint64_t maxZapReceipts = 20'000;
 static const uint64_t engagementCacheSeconds = 600;
 
 
+bool isEngagementKind(uint64_t kind) {
+    return kind == 9735 || std::find(engagementKinds.begin(), engagementKinds.end(), kind) != engagementKinds.end();
+}
+
+
 static bool hasTag(const PackedEventView &ev, char name) {
     bool found = false;
     ev.foreachTag([&](char tagName, std::string_view){

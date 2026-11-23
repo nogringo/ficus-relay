@@ -207,6 +207,7 @@ struct RelayServer {
     std::thread signalHandlerThread;
     std::thread banyanTrustThread;
     std::thread banyanHarvesterThread;
+    std::thread banyanPruneThread;
 
     void run();
 

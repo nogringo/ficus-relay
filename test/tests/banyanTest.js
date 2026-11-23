@@ -1,4 +1,5 @@
-// Banyan virtual relays: path routing, universe scoping, trust circles, admin API.
+// Banyan virtual relays: path routing, universe scoping, trust circles, admin API, thread filters,
+// owner self-management, pruning, and the harvester's NIP-42 AUTH and inbox delivery against a fake upstream relay.
 // Needs `nak` (https://github.com/fiatjaf/nak) on PATH to generate keys and sign events.
 
 import os from "node:os";
@@ -7,6 +8,9 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
+import { WebSocketServer } from "ws";
+import { matchFilters } from "@nostr/tools/filter";
+import { verifyEvent } from "@nostr/tools/pure";
 
 const workDir = path.join(os.tmpdir(), "strfry-banyan-tests");
 const dbDir = path.join(workDir, "db");
@@ -14,6 +18,8 @@ const cfgPath = path.join(workDir, "banyan.conf");
 const port = 40560;
 const httpBase = `http://127.0.0.1:${port}`;
 const wsBase = `ws://127.0.0.1:${port}`;
+const upstreamPort = 40561;
+const upstreamUrl = `ws://127.0.0.1:${upstreamPort}`;
 
 const pass = (msg) => console.log(`Pass: ${msg}`);
 
@@ -32,6 +38,18 @@ function makeKey() {
 }
 
 let ts = Math.floor(Date.now() / 1000) - 10 * 86400;
+
+const now = () => Math.floor(Date.now() / 1000);
+
+async function until(what, fn, timeoutMs = 20000) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    const v = await fn();
+    if (v) return v;
+    await delay(250);
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
 
 function sign(key, { kind = 1, content = "", tags = [], created_at } = {}) {
   const args = ["event", "--sec", key.sec, "-k", String(kind), "-c", content, "--ts", String(created_at ?? ts++)];
@@ -142,6 +160,11 @@ const zed = makeKey(); // alice zapped zed once, zed replies to alice: primary t
 const forger = makeKey(); // forges receipts saying alice zapped them, and reacts to alice a lot
 const flooder = makeKey(); // alice answered once, then floods alice with reactions
 const lnurl = makeKey(); // signs zap receipts, like an LNURL server
+const outsider = makeKey(); // in no universe and mentions no seed: pruned
+
+// Seeded events by name, for the thread and pruning tests
+const T = {};
+let seeded = [];
 
 function seedEvents() {
   const events = [];
@@ -150,7 +173,7 @@ function seedEvents() {
   const a1 = add(sign(alice, { content: "alice note" }));
   const b1 = add(sign(bob, { content: "bob note" }));
   const c1 = add(sign(carol, { content: "carol note" }));
-  add(sign(stranger, { content: "stranger note" }));
+  T.strangerNote = add(sign(stranger, { content: "stranger note" }));
   add(sign(dave, { content: "dave note" }));
 
   for (let i = 0; i < 2; i++) {
@@ -194,12 +217,34 @@ function seedEvents() {
     add(sign(flooder, { kind: 7, content: "+", tags: [["e", a1.id], ["p", alice.pub]] }));
   }
 
+  // A thread whose replies only e-tag their parent, so following it takes recursion
+  T.root = add(sign(alice, { content: "thread root" }));
+  T.bob = add(sign(bob, { content: "bob in thread", tags: [["e", T.root.id], ["p", alice.pub]] }));
+  T.carol = add(sign(carol, { content: "carol to bob", tags: [["e", T.bob.id], ["p", bob.pub]] }));
+  T.stranger = add(sign(stranger, { content: "stranger to bob", tags: [["e", T.bob.id], ["p", bob.pub]] }));
+  // No p tag: answering the stranger would make them bob's mutual peer
+  T.behindStranger = add(sign(bob, { content: "bob to stranger", tags: [["e", T.stranger.id]] }));
+  T.reaction = add(sign(alice, { kind: 7, content: "+", tags: [["e", T.carol.id], ["p", carol.pub]] }));
+
+  // Comments on an article reference it by address, not by id
+  T.article = add(sign(alice, { kind: 30023, content: "article", tags: [["d", "post"]] }));
+  const coord = `30023:${alice.pub}:post`;
+  T.comment = add(sign(bob, { kind: 1111, content: "comment", tags: [["A", coord], ["a", coord], ["K", "30023"], ["k", "30023"], ["P", alice.pub], ["p", alice.pub]] }));
+  T.commentReply = add(sign(carol, { kind: 1111, content: "reply to comment", tags: [["A", coord], ["e", T.comment.id], ["K", "30023"], ["k", "1111"], ["P", alice.pub], ["p", bob.pub]] }));
+
+  T.outsiderNote = add(sign(outsider, { content: "outsider note" }));
+  T.outsiderFollows = add(sign(outsider, { kind: 3, tags: [["p", alice.pub]] }));
+  T.outsiderOld = add(sign(outsider, { content: "too old to be trust evidence", tags: [["p", alice.pub]], created_at: now() - 400 * 86400 }));
+  T.outsiderReply = add(sign(outsider, { content: "outsider replies to alice", tags: [["e", a1.id], ["p", alice.pub]] }));
+
   return events;
 }
 
-function writeConfig() {
-  rmSync(workDir, { recursive: true, force: true });
-  mkdirSync(dbDir, { recursive: true });
+function writeConfig({ harvester = false } = {}) {
+  if (!harvester) {
+    rmSync(workDir, { recursive: true, force: true });
+    mkdirSync(dbDir, { recursive: true });
+  }
   writeFileSync(
     cfgPath,
     `
@@ -234,7 +279,10 @@ banyan {
   }
 
   harvester {
-    enabled = false
+    enabled = ${harvester}
+    bootstrapRelays = "${upstreamUrl}"
+    allowPrivateAddresses = true
+    replanIntervalSeconds = 2
   }
 }
 `,
@@ -316,7 +364,8 @@ async function testScopedReads() {
 
   c.send(["COUNT", "cnt", { kinds: [1], authors: [stranger.pub, bob.pub] }]);
   const count = await c.waitFor((m) => m[0] === "COUNT");
-  expect(count[2].count === 5, `COUNT only counts universe events, got ${count[2].count}`);
+  const bobNotes = seeded.filter((e) => e.pubkey === bob.pub && e.kind === 1).length;
+  expect(count[2].count === bobNotes, `COUNT only counts universe events, got ${count[2].count}, expected ${bobNotes}`);
   c.close();
 
   const byNpub = await connect(alice.npub);
@@ -441,20 +490,243 @@ async function testAdminApi() {
   pass("testAdminApi");
 }
 
+const ids = (events) => new Set(events.map((e) => e.id));
+const sameIds = (events, expected) => {
+  const got = ids(events);
+  return got.size === expected.length && expected.every((e) => got.has(e.id));
+};
+
+async function testThreadQueries() {
+  const c = await connect("alice");
+
+  const whole = await c.req("th", { thread: [T.root.id] });
+  expect(sameIds(whole, [T.root, T.bob, T.carol, T.reaction]), `whole thread, got ${whole.map((e) => e.content).join(" | ")}`);
+  expect(!ids(whole).has(T.behindStranger.id), "a thread does not grow through people outside the universe");
+
+  const notes = await c.req("th1", { thread: [T.root.id], kinds: [1] });
+  expect(sameIds(notes, [T.root, T.bob, T.carol]), "other filter fields narrow the thread");
+
+  const sub = await c.req("th2", { thread: [T.bob.id] });
+  expect(sameIds(sub, [T.bob, T.carol, T.reaction]), "a sub-thread starts anywhere");
+
+  const limited = await c.req("th3", { thread: [T.root.id], limit: 2 });
+  expect(limited.length === 2, "limit applies to the thread");
+
+  const article = await c.req("th4", { thread: [T.article.id] });
+  expect(sameIds(article, [T.article, T.comment, T.commentReply]), "comments reached through the article's address");
+
+  c.send(["COUNT", "thc", { thread: [T.root.id] }]);
+  const count = await c.waitFor((m) => m[0] === "COUNT");
+  expect(count[2].count === 4, `COUNT on a thread, got ${count[2].count}`);
+
+  const live = await c.req("live", { thread: [T.root.id] });
+  expect(live.length === 4, "live thread subscription starts with the stored thread");
+  const nextLive = () => c.waitFor((m) => m[0] === "EVENT" && m[1] === "live");
+
+  const r1 = sign(bob, { content: "live reply", tags: [["e", T.carol.id], ["p", carol.pub]], created_at: now() });
+  expect((await c.publish(r1))[2] === true, "publish live reply");
+  expect((await nextLive())[2].id === r1.id, "live reply to a stored node");
+
+  const r2 = sign(carol, { content: "reply to the live reply", tags: [["e", r1.id], ["p", bob.pub]], created_at: now() });
+  await c.publish(r2);
+  expect((await nextLive())[2].id === r2.id, "the thread grows with live replies");
+
+  // Harvested backfills arrive newest first: a reply can land before its parent
+  const parent = sign(bob, { content: "late parent", tags: [["e", r2.id], ["p", carol.pub]], created_at: now() });
+  const child = sign(carol, { content: "early child", tags: [["e", parent.id], ["p", bob.pub]], created_at: now() });
+  await c.publish(child);
+  let early = false;
+  c.waitFor((m) => m[0] === "EVENT" && m[1] === "live" && m[2].id === child.id, 1000).then(() => (early = true), () => {});
+  await delay(1200);
+  expect(!early, "a reply to an unknown event is not part of the thread yet");
+  await c.publish(parent);
+  const got = new Set([(await nextLive())[2].id, (await nextLive())[2].id]);
+  expect(got.has(parent.id) && got.has(child.id), "the parent brings the reply that came before it");
+
+  // Narrowed to carol, the subscription still follows the thread through bob's replies
+  await c.req("carol", { thread: [T.root.id], authors: [carol.pub] });
+  const viaBob = sign(bob, { content: "bob, not for carol's subscription", tags: [["e", child.id], ["p", carol.pub]], created_at: now() });
+  await c.publish(viaBob);
+  const underBob = sign(carol, { content: "carol under bob", tags: [["e", viaBob.id], ["p", bob.pub]], created_at: now() });
+  await c.publish(underBob);
+  const narrowed = await c.waitFor((m) => m[0] === "EVENT" && m[1] === "carol");
+  expect(narrowed[2].id === underBob.id, "a narrowed thread grows through events it does not send");
+
+  c.send(["REQ", "bad", { thread: ["zz"] }]);
+  const bad = await c.waitFor((m) => (m[0] === "CLOSED" && m[1] === "bad") || m[0] === "NOTICE");
+  expect(String(bad[bad.length - 1]).includes("thread"), "invalid thread ids are refused");
+  c.close();
+  pass("testThreadQueries");
+}
+
+async function testOwnerManagesOwnRelay() {
+  const who = await rpc(alice, "whoami");
+  expect(who.json.result.isAdmin === false && who.json.result.tenant === "alice", `owner recognised: ${JSON.stringify(who.json)}`);
+  expect(who.json.result.ownerLimits.primaryCircleSize === 100, "owner limits advertised");
+
+  const list = await rpc(alice, "listtenants");
+  expect(list.status === 200 && list.json.result.length === 1 && list.json.result[0].slug === "alice", "owners only list their own relay");
+
+  expect((await rpc(alice, "gettenant", ["dave"])).status === 403, "another person's relay is refused");
+  expect((await rpc(alice, "addtenant", [eve.npub, "eve"])).status === 403, "owners can't add people");
+  expect((await rpc(alice, "harveststatus")).status === 403, "harvester status stays admin-only");
+  expect((await rpc(alice, "updatetenant", ["alice", { slug: "alicia" }])).status === 403, "owners can't change their slug");
+
+  const tooBig = await rpc(alice, "updatetenant", ["alice", { primaryCircleSize: 5000 }]);
+  expect(typeof tooBig.json.error === "string", "owner limits are enforced");
+
+  const pinned = await rpc(alice, "updatetenant", ["alice", { pinned: [eve.npub] }]);
+  expect(pinned.json.result.members.some((m) => m.pubkey === eve.pub && m.circle === "pinned"), `owner pins someone: ${JSON.stringify(pinned.json).slice(0, 200)}`);
+  expect((await rpc(alice, "recomputetrust", ["alice"])).json.result === true, "owner recomputes their trust");
+  await rpc(alice, "updatetenant", ["alice", { pinned: [] }]);
+
+  const nobody = await rpc(stranger, "whoami");
+  expect(nobody.json.result.tenant === null, "no relay for strangers");
+  expect((await rpc(stranger, "gettenant", ["alice"])).status === 403, "strangers are refused");
+
+  const landing = await (await fetch(`${httpBase}/alice`)).text();
+  expect(landing.includes('href="/admin"'), "landing page links owners to the management page");
+  pass("testOwnerManagesOwnRelay");
+}
+
+function scanIds(filter) {
+  const out = strfry(["scan", JSON.stringify(filter)]).trim();
+  return new Set(out ? out.split("\n").map((l) => JSON.parse(l).id) : []);
+}
+
+async function testPrune() {
+  const dry = strfry(["banyan", "prune", "--dry-run"]);
+  expect(dry.includes("Would delete 4 "), `dry run: ${dry}`);
+  expect(scanIds({ authors: [outsider.pub] }).size === 4, "a dry run deletes nothing");
+
+  const out = strfry(["banyan", "prune"]);
+  expect(out.includes("Deleted 4 "), `prune: ${out}`);
+
+  const left = scanIds({ authors: [outsider.pub] });
+  expect(left.size === 1 && left.has(T.outsiderReply.id), "only trust evidence is left of an outsider");
+  expect(scanIds({ ids: [T.strangerNote.id] }).size === 0, "a stranger's note that mentions no seed goes");
+  expect(scanIds({ ids: [T.stranger.id, T.root.id, T.comment.id] }).size === 3, "universe events and mentions of seeds stay");
+
+  const c = await connect("alice");
+  expect((await c.req("after", { thread: [T.root.id] })).length >= 4, "the relay serves the same thread after pruning");
+  c.close();
+  pass("testPrune");
+}
+
+// A relay that refuses everything until NIP-42 AUTH, like many paid or private relays
+function startUpstream(stored) {
+  const received = [];
+  const authed = new Set();
+  const wss = new WebSocketServer({ port: upstreamPort, host: "127.0.0.1" });
+
+  wss.on("connection", (ws) => {
+    const challenge = Math.random().toString(36).slice(2);
+    let pubkey = null, challenged = false;
+    const send = (m) => ws.send(JSON.stringify(m));
+    const requireAuth = () => {
+      if (!challenged) send(["AUTH", challenge]);
+      challenged = true;
+    };
+
+    ws.on("message", (data) => {
+      const [type, ...rest] = JSON.parse(String(data));
+      if (type === "AUTH") {
+        const ev = rest[0];
+        const tag = (n) => (ev.tags.find((t) => t[0] === n) || [])[1];
+        const ok = verifyEvent(ev) && ev.kind === 22242 && tag("challenge") === challenge && tag("relay") === upstreamUrl;
+        if (ok) {
+          pubkey = ev.pubkey;
+          authed.add(ev.pubkey);
+        }
+        send(["OK", ev.id, ok, ok ? "" : "invalid: bad AUTH"]);
+      } else if (type === "REQ") {
+        const [subId, ...filters] = rest;
+        if (!pubkey) {
+          requireAuth();
+          return send(["CLOSED", subId, "auth-required: sign in first"]);
+        }
+        const matching = stored.filter((e) => matchFilters(filters, e)).sort((a, b) => b.created_at - a.created_at);
+        const limit = Math.min(...filters.map((f) => f.limit ?? Infinity));
+        for (const e of matching.slice(0, limit)) send(["EVENT", subId, e]);
+        send(["EOSE", subId]);
+      } else if (type === "EVENT") {
+        const ev = rest[0];
+        if (!pubkey) {
+          requireAuth();
+          return send(["OK", ev.id, false, "auth-required: sign in first"]);
+        }
+        received.push(ev);
+        send(["OK", ev.id, true, ""]);
+      }
+    });
+  });
+
+  return { wss, received, authed };
+}
+
+async function testHarvesterAuthAndDelivery() {
+  const inbox = (pk) => sign(pk, { kind: 10002, tags: [["r", upstreamUrl]], created_at: now() - 120 });
+  const upstreamNote = sign(carol, { content: "carol, only upstream", created_at: now() - 60 });
+  const upstream = startUpstream([inbox(bob), inbox(dave), upstreamNote]);
+
+  writeConfig({ harvester: true });
+  const relay = startRelay();
+
+  try {
+    await waitForHttp();
+    const c = await connect("alice");
+
+    await until("the harvester to fetch past AUTH", async () => (await c.req(`u${Date.now()}`, { ids: [upstreamNote.id] })).length === 1);
+    const status = (await rpc(admin, "harveststatus")).json.result;
+    expect(upstream.authed.has(status.authPubkey), "the harvester authenticated with the key it reports");
+    expect(status.relays.some((r) => r.url === upstreamUrl && r.auth === "ok"), "harveststatus shows the relay as authenticated");
+
+    // Bob's relay list says his inbox is upstream: the reply must reach it
+    await until("bob's relay list", async () => (await c.req(`l${Date.now()}`, { kinds: [10002], authors: [bob.pub] })).length === 1);
+    await delay(3000); // next replan picks up the relay list
+    const reply = sign(alice, { content: "alice to bob, delivered", tags: [["e", T.bob.id], ["p", bob.pub]], created_at: now() });
+    const toDave = sign(alice, { content: "alice to dave, not delivered", tags: [["p", dave.pub]], created_at: now() });
+    expect((await c.publish(reply))[2] === true && (await c.publish(toDave))[2] === true, "publish on /alice");
+
+    await until("the reply in bob's inbox", () => upstream.received.some((e) => e.id === reply.id));
+    await delay(2000);
+    expect(!upstream.received.some((e) => e.id === toDave.id), "people outside the author's universe get nothing");
+    expect(!upstream.received.some((e) => e.id === upstreamNote.id), "events are not sent back where they came from");
+    c.close();
+    pass("testHarvesterAuthAndDelivery");
+  } finally {
+    await stopRelay(relay);
+    upstream.wss.close();
+  }
+}
+
+let relayLogs = "";
+
+function startRelay() {
+  const relay = spawn("./strfry", ["--config", cfgPath, "relay"], { stdio: ["ignore", "pipe", "pipe"] });
+  relay.stdout.on("data", (d) => (relayLogs += d));
+  relay.stderr.on("data", (d) => (relayLogs += d));
+  return relay;
+}
+
+async function stopRelay(relay) {
+  const exited = new Promise((resolve) => relay.on("exit", resolve));
+  relay.kill("SIGTERM");
+  await Promise.race([exited, delay(5000)]);
+}
+
 async function main() {
   writeConfig();
 
-  strfry(["import"], seedEvents().map((e) => JSON.stringify(e)).join("\n") + "\n");
+  seeded = seedEvents();
+  strfry(["import"], seeded.map((e) => JSON.stringify(e)).join("\n") + "\n");
   strfry(["banyan", "add", alice.npub, "alice"]);
   strfry(["banyan", "add", dave.pub, "dave"]);
 
   await testTrustCircles();
   await testBlockedFreeTheirSlot();
 
-  const relay = spawn("./strfry", ["--config", cfgPath, "relay"], { stdio: ["ignore", "pipe", "pipe"] });
-  let logs = "";
-  relay.stdout.on("data", (d) => (logs += d));
-  relay.stderr.on("data", (d) => (logs += d));
+  let relay = startRelay();
 
   try {
     await waitForHttp();
@@ -464,12 +736,19 @@ async function main() {
     await testAuthIsBoundToPath();
     await testHttp();
     await testAdminApi();
+    await testThreadQueries();
+    await testOwnerManagesOwnRelay();
+    await testPrune();
+    await stopRelay(relay);
+    relay = null;
+    await testHarvesterAuthAndDelivery();
   } catch (e) {
     console.error(e);
-    console.error(`\nRelay logs:\n${logs.split("\n").slice(-60).join("\n")}`);
+    console.error(`\nRelay logs:\n${relayLogs.split("\n").slice(-80).join("\n")}`);
     process.exitCode = 1;
   } finally {
-    relay.kill("SIGTERM");
+    if (relay) relay.kill("SIGTERM");
+    writeFileSync(path.join(workDir, "relay.log"), relayLogs);
   }
 }
 

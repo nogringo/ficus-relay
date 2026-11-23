@@ -7,6 +7,7 @@
 #include "apps/banyan/Tenants.h"
 #include "apps/banyan/TrustEngine.h"
 #include "apps/banyan/Harvester.h"
+#include "apps/banyan/Pruner.h"
 
 
 static const char USAGE[] =
@@ -104,6 +105,10 @@ void RelayServer::run() {
 
         banyanTrustThread = std::thread([]{
             banyan::runTrustEngine();
+        });
+
+        banyanPruneThread = std::thread([]{
+            banyan::runPruner();
         });
 
         if (cfg().banyan__harvester__enabled) {

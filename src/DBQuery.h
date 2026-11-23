@@ -5,6 +5,7 @@
 #include "Subscription.h"
 #include "filters.h"
 #include "events.h"
+#include "ThreadFilter.h"
 #include "apps/banyan/Tenants.h"
 
 
@@ -112,7 +113,7 @@ struct DBScan : NonCopyable {
         // A scoped filter on kinds alone would walk every tenant's events, so walk the universe's authors instead.
         // Gift wraps are signed by random keys, so filters that may match them keep the regular scan.
         std::vector<std::string> scopeAuthors;
-        if (scope && !f.ids && f.tags.empty() && !f.authors && f.kinds && scope->universe.size() * f.kinds->size() <= maxScopeCursors) {
+        if (scope && !f.ids && f.tags.empty() && !f.authors && !f.thread && f.kinds && scope->universe.size() * f.kinds->size() <= maxScopeCursors) {
             bool mayMatchGiftWraps = false;
             for (uint64_t j = 0; j < f.kinds->size(); j++) {
                 if (f.kinds->at(j) == 1059 || f.kinds->at(j) == 21059) mayMatchGiftWraps = true;
@@ -122,7 +123,24 @@ struct DBScan : NonCopyable {
             }
         }
 
-        if (f.ids) {
+        if (f.thread) {
+            // Expanded by DBQuery before the scan, so every node is a known id
+            indexDbi = env.dbi_Event__id;
+            desc = "Thread";
+
+            cursors.reserve(f.thread->nodes.size());
+            for (const auto &node : f.thread->nodes) {
+                std::string search = node.str();
+
+                cursors.emplace_back(
+                    search + std::string(8, '\xFF'),
+                    MAX_U64,
+                    [search](std::string_view k){
+                        return k.starts_with(search) ? KeyMatchResult::Yes : KeyMatchResult::No;
+                    }
+                );
+            }
+        } else if (f.ids) {
             indexDbi = env.dbi_Event__id;
             desc = "ID";
 
@@ -343,7 +361,10 @@ struct DBQuery : NonCopyable {
         while (filterGroupIndex < sub.filterGroup.size()) {
             const auto &f = sub.filterGroup.filters[filterGroupIndex];
 
-            if (!scanner) scanner = std::make_unique<DBScan>(f, sub.scope.get());
+            if (!scanner) {
+                if (f.thread) expandThread(txn, *f.thread, sub.scope.get(), sub.latestEventId);
+                scanner = std::make_unique<DBScan>(f, sub.scope.get());
+            }
 
             uint64_t startTime = hoytech::curr_time_us();
 

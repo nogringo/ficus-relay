@@ -75,6 +75,11 @@ struct TenantView {
     std::vector<UniverseMember> members; // owner first, then pinned, primary, secondary
     flat_hash_set<Bytes32> universe;
 
+    // Pruning keeps these too: blocked people and those reached only through them, so unblocking stays immediate
+    flat_hash_set<Bytes32> retained;
+    // Whose incoming engagement the trust engine reads: owner, pinned and primary, blocked ones included
+    flat_hash_set<Bytes32> trustSeeds;
+
     bool inUniverse(std::string_view pubkey) const {
         return universe.contains(Bytes32(pubkey));
     }

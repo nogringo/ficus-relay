@@ -254,12 +254,24 @@ static TenantPtr buildTenantView(uint64_t id, std::string_view pubkey, std::stri
         t->members.push_back(std::move(m));
     };
 
+    t->retained.insert(t->pubkey);
+    t->trustSeeds.insert(t->pubkey);
+    for (const auto &pk : t->settings.pinned) {
+        t->retained.insert(pk);
+        t->trustSeeds.insert(pk);
+    }
+    for (const auto &pk : t->settings.blocked) t->retained.insert(pk);
+
     add(UniverseMember{ t->pubkey, Circle::Owner, 0, {} });
 
     for (const auto &pk : t->settings.pinned) add(UniverseMember{ pk, Circle::Pinned, 0, {} });
 
     try {
-        for (auto &m : parseComputedMembers(computedJson)) add(std::move(m));
+        for (auto &m : parseComputedMembers(computedJson)) {
+            t->retained.insert(m.pubkey);
+            if (m.circle == Circle::Primary) t->trustSeeds.insert(m.pubkey);
+            add(std::move(m));
+        }
     } catch (std::exception &e) {
         LE << "Banyan: invalid computed universe for tenant " << slug << ": " << e.what();
     }

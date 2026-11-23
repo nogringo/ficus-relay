@@ -146,7 +146,7 @@ details[open] > summary::before { transform: rotate(90deg); }
 <header class="top">
   <a class="brand" href="#/">
     <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><circle cx="12" cy="8" r="6"/><circle cx="5.5" cy="11" r="4"/><circle cx="18.5" cy="11" r="4"/><rect x="11" y="12" width="2" height="10"/><rect x="5" y="13" width="1.5" height="9"/><rect x="17.5" y="13" width="1.5" height="9"/></svg>
-    Banyan admin
+    <span id="brand">Banyan admin</span>
   </a>
   <nav id="nav" hidden><a href="#/" data-nav="people">People</a><a href="#/harvest" data-nav="harvest">Harvester</a></nav>
   <div class="who" id="who" hidden><span class="mono" id="who-npub"></span><a href="#" data-act="logout">Log out</a></div>
@@ -155,7 +155,7 @@ details[open] > summary::before { transform: rotate(90deg); }
 <script>
 "use strict";
 const KEY = "banyan-admin-pubkey";
-const S = { pubkey: null, admin: false, nav: 0, tenants: null, tenant: null, byPk: new Map(), filter: "" };
+const S = { pubkey: null, admin: false, own: null, limits: null, nav: 0, tenants: null, tenant: null, byPk: new Map(), filter: "" };
 const $ = sel => document.querySelector(sel);
 const app = $("#app");
 const WEIGHTS = ["reply", "repost", "reaction", "zap", "mention"];
@@ -337,6 +337,7 @@ async function waitNostr() {
 function setHeader() {
   $("#who").hidden = !S.pubkey;
   $("#nav").hidden = !S.admin;
+  $("#brand").textContent = S.pubkey && !S.admin && S.own ? "Banyan" : "Banyan admin";
   if (!S.pubkey) return;
   const n = npubEncode(S.pubkey), el = $("#who-npub");
   el.textContent = short(n);
@@ -346,10 +347,11 @@ function renderLogin(msg) {
   S.nav++;
   S.pubkey = null;
   S.admin = false;
+  S.own = null;
   setHeader();
   app.innerHTML = `<section class="card login">
   <h1>Sign in</h1>
-  <p>Manage the people hosted on this relay and their virtual relays. Sign in with the Nostr key of a relay admin.</p>
+  <p>Sign in with your Nostr key to manage your own relay here, or with the key of a relay admin to manage everyone's.</p>
   ${window.nostr
     ? '<button class="btn" data-act="login">Log in with extension</button>'
     : '<p class="note">Signing in needs a NIP-07 browser extension, like Alby or nos2x, that holds your Nostr key. Install one, then reload this page.</p>'}
@@ -367,6 +369,7 @@ function logout() {
 async function enter(pk) {
   S.pubkey = pk;
   S.admin = false;
+  S.own = null;
   setHeader();
   const tok = ++S.nav;
   app.innerHTML = '<p class="muted pad">Checking access...</p>';
@@ -378,13 +381,18 @@ async function enter(pk) {
   if (tok !== S.nav) return;
   S.pubkey = (me && me.pubkey) || pk;
   S.admin = !!(me && me.isAdmin);
+  S.own = (me && me.tenant) || null;
+  S.limits = (me && me.ownerLimits) || null;
   store(S.pubkey);
   setHeader();
-  if (S.admin) route();
-  else app.innerHTML = '<section class="card login"><p>This pubkey is not an admin of this relay.</p></section>';
+  if (S.admin || S.own) route();
+  else app.innerHTML = '<section class="card login"><p>This pubkey has no relay here and is not an admin of this relay.</p></section>';
 }
 
+const owner = () => !S.admin && !!S.own;
+
 function route() {
+  if (owner()) return showTenant(S.own);
   if (!S.admin) return;
   const h = location.hash.slice(1) || "/", m = h.match(/^\/t\/(.+)$/);
   const tab = h === "/harvest" ? "harvest" : "people";
@@ -453,11 +461,13 @@ async function addTenant(form) {
 function detailShell() {
   const field = (name, label, attrs, hint = "") => `<label class="field"><span>${label}</span><input name="${name}" ${attrs}>${hint && `<small>${hint}</small>`}</label>`;
   const num = 'type="number" step="any" inputmode="decimal"', int = 'type="number" min="0" step="1" inputmode="numeric"';
+  const lim = owner() ? S.limits || {} : {}, max = k => lim[k] != null ? ` max="${esc(lim[k])}"` : "";
+  const upTo = k => lim[k] != null ? ` At most ${fmt(lim[k])} on this server.` : "";
   const listEditor = (kind, form, title, hint, verb) => `<h2>${title}</h2><p class="muted small">${hint}</p>
     <form id="${form}" class="inline-form" novalidate><input name="pk" placeholder="npub1... or hex pubkey" aria-label="${verb} a pubkey" autocomplete="off" autocapitalize="none" spellcheck="false"><button class="btn ghost">${verb}</button></form>
     <p class="msg" data-msg="${kind}" hidden></p>
     <ul class="pk-list" id="${kind}-list" data-zone="${kind}"></ul>`;
-  return `${BACK}
+  return `${owner() ? "" : BACK}
 <section class="card">
   <div class="head">
     <div class="grow"><h1 id="t-title"></h1><div class="mono muted small" id="t-npub"></div></div>
@@ -475,19 +485,19 @@ function detailShell() {
         <small class="hint">How much each kind of interaction counts toward a peer's score.</small>
       </fieldset>
       <fieldset><legend>Circles</legend><div class="fields">
-        ${field("primaryCircleSize", "Primary circle size", int, "Top peers of the owner.")}
-        ${field("secondaryPerPeer", "Secondary per peer", int, "Top peers taken from each primary member.")}
+        ${field("primaryCircleSize", "Primary circle size", int + max("primaryCircleSize"), "Top peers of the owner." + upTo("primaryCircleSize"))}
+        ${field("secondaryPerPeer", "Secondary per peer", int + max("secondaryPerPeer"), "Top peers taken from each primary member." + upTo("secondaryPerPeer"))}
         ${field("minScore", "Minimum score", num, "Peers scoring below this are left out.")}
       </div></fieldset>
-      <fieldset><legend>Relay path</legend><div class="fields">
+      ${owner() ? "" : `<fieldset><legend>Relay path</legend><div class="fields">
         ${field("slug", "Slug", 'maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false"', "Changing it changes the relay URL. The npub URL keeps working.")}
-      </div></fieldset>
+      </div></fieldset>`}
       <button class="btn">Save</button>
       <p class="msg" data-msg="settings" hidden></p>
     </form>
   </section>
   <section class="card">
-    ${listEditor("pinned", "pin-form", "Pinned", "Always in the universe, whatever their score.", "Pin")}
+    ${listEditor("pinned", "pin-form", "Pinned", "Always in the universe, whatever their score." + upTo("pinned"), "Pin")}
     ${listEditor("blocked", "block-form", "Blocked", "Never in the universe, even with a high score.", "Block")}
   </section>
 </div>
@@ -496,12 +506,12 @@ function detailShell() {
   <p class="msg" data-msg="members" hidden></p>
   <div id="t-members" data-zone="members"></div>
 </section>
-<section class="card danger-zone">
+${owner() ? "" : `<section class="card danger-zone">
   <h2>Remove person</h2>
   <p class="muted small">Their virtual relay stops serving events. You can add them again later.</p>
   <button class="btn danger" data-act="remove">Remove person</button>
   <p class="msg" data-msg="remove" hidden></p>
-</section>`;
+</section>`}`;
 }
 async function showTenant(id) {
   const tok = ++S.nav;
@@ -546,7 +556,7 @@ function fillSettings(s) {
   const f = $("#settings-form").elements, w = s.weights || {};
   for (const k of WEIGHTS) f["w_" + k].value = w[k] ?? "";
   for (const k of ["primaryCircleSize", "secondaryPerPeer", "minScore"]) f[k].value = s[k] ?? "";
-  f.slug.value = S.tenant.slug;
+  if (f.slug) f.slug.value = S.tenant.slug;
 }
 function paintList(kind) {
   const ul = $(`#${kind}-list`);
@@ -617,7 +627,11 @@ async function saveSettings(form) {
     patch.primaryCircleSize = read("primaryCircleSize", "Primary circle size", true);
     patch.secondaryPerPeer = read("secondaryPerPeer", "Secondary per peer", true);
     patch.minScore = read("minScore", "Minimum score", false);
-    const slug = f.slug.value.trim();
+    const lim = owner() ? S.limits || {} : {};
+    for (const [k, label] of [["primaryCircleSize", "Primary circle size"], ["secondaryPerPeer", "Secondary per peer"]]) {
+      if (lim[k] != null && patch[k] > lim[k]) throw new Error(`${label} can be at most ${fmt(lim[k])} on this server.`);
+    }
+    const slug = f.slug ? f.slug.value.trim() : S.tenant.slug;
     if (slug !== S.tenant.slug) {
       const bad = slugError(slug);
       if (bad) throw new Error(bad);
@@ -626,7 +640,7 @@ async function saveSettings(form) {
   } catch (e) { return setMsg("settings", e.message); }
   await act(form.querySelector("button"), "Saving...", "settings", async () => {
     const current = await tenantRpc("updatetenant", [S.tenant.pubkey, patch], true);
-    if (current && patch.slug) history.replaceState(null, "", "#/t/" + encodeURIComponent(S.tenant.slug));
+    if (current && patch.slug && !owner()) history.replaceState(null, "", "#/t/" + encodeURIComponent(S.tenant.slug));
     return "Saved";
   });
 }
@@ -672,13 +686,15 @@ async function loadHarvest() {
   const box = $("#harvest");
   if (tok !== S.nav || !box) return;
   const relays = Array.isArray(h.relays) ? h.relays : [], on = relays.filter(r => r.connected).length;
-  box.innerHTML = `<p class="small">${fmt(h.targets)} pubkeys targeted, ${fmt(on)} of ${fmt(relays.length)} relays connected. <span class="muted">Updated ${esc(new Date().toLocaleTimeString("en"))}.</span></p>`
+  const auth = h.authPubkey ? `<p class="small muted">Answers NIP-42 AUTH as <span class="mono" title="${esc(npubEncode(h.authPubkey))}">${esc(short(npubEncode(h.authPubkey)))}</span>. Whitelist this key on paid or private relays.</p>` : "";
+  box.innerHTML = `<p class="small">${fmt(h.targets)} pubkeys targeted, ${fmt(on)} of ${fmt(relays.length)} relays connected, ${fmt(h.delivered)} events delivered to inboxes. <span class="muted">Updated ${esc(new Date().toLocaleTimeString("en"))}.</span></p>${auth}`
     + (relays.length ? `<div class="relays">${relays.map(relayRow).join("")}</div>` : '<p class="muted empty">No relays in use yet.</p>');
 }
 function relayRow(r) {
-  const stats = [["Subscriptions", r.subs], ["Authors", r.authors], ["Inbox targets", r.inboxTargets], ["Events received", r.eventsReceived]];
+  const stats = [["Subscriptions", r.subs], ["Authors", r.authors], ["Inbox targets", r.inboxTargets], ["Events received", r.eventsReceived], ["Delivered", r.delivered], ["Waiting to deliver", r.deliveryQueue]];
+  const auth = { ok: ", authenticated", sent: ", authenticating", wanted: ", waiting for an AUTH challenge", failed: ", AUTH refused" }[r.auth] || "";
   return `<article class="relay ${r.connected ? "on" : "off"}">
-  <div class="r-head"><span class="dot"></span><span class="mono">${esc(r.url)}</span><span class="state">${r.connected ? "Connected" : "Disconnected"}</span></div>
+  <div class="r-head"><span class="dot"></span><span class="mono">${esc(r.url)}</span><span class="state">${r.connected ? "Connected" : "Disconnected"}${esc(auth)}</span></div>
   <dl class="kv">${stats.map(([k, v]) => `<div><dt>${k}</dt><dd>${fmt(v)}</dd></div>`).join("")}</dl>
   ${r.lastError ? `<p class="r-err">${esc(r.lastError)}</p>` : ""}
 </article>`;

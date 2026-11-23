@@ -46,13 +46,29 @@ void RelayServer::runReqMonitor(ThreadPool<MsgReqMonitor>::Thread &thr) {
                 Bytes32 connAuthedPubkey = it == connIdToAuthedPubkey.end() ? Bytes32() : it->second;
                 if (msg->sub.tenantId) connIdToTenantId[connId] = msg->sub.tenantId;
 
+                auto deliver = [&](uint64_t levId){
+                    auto view = env.lookup_Event(txn, levId);
+                    if (!view) return;
+                    PackedEventView packed(view->buf);
+                    if (tenantCanSee(*tenantSnap, connId, packed) && ReadRestrictor::shouldSendToSubscriber(packed, connAuthedPubkey)) {
+                        sendEvent(connId, msg->sub.subId, getEventJson(txn, decomp, levId));
+                    }
+                };
+
                 env.foreach_Event(txn, [&](auto &ev){
                     PackedEventView packed(ev.buf);
-                    if (msg->sub.filterGroup.doesMatch(packed) && tenantCanSee(*tenantSnap, connId, packed)) {
-                        if (ReadRestrictor::shouldSendToSubscriber(packed, connAuthedPubkey)) {
-                            sendEvent(connId, msg->sub.subId, getEventJson(txn, decomp, ev.primaryKeyId));
+                    bool matched = false;
+
+                    for (auto &f : msg->sub.filterGroup.filters) {
+                        if (f.thread && f.thread->contains(packed)) {
+                            absorbIntoThread(txn, *f.thread, msg->sub.scope.get(), packed, ev.primaryKeyId, [](char, std::string_view){},
+                                [&](uint64_t levId, const PackedEventView &late){ if (f.doesMatch(late)) deliver(levId); });
                         }
+
+                        if (f.doesMatch(packed)) matched = true;
                     }
+
+                    if (matched) deliver(ev.primaryKeyId);
 
                     return true;
                 }, false, msg->sub.latestEventId + 1);
@@ -73,7 +89,12 @@ void RelayServer::runReqMonitor(ThreadPool<MsgReqMonitor>::Thread &thr) {
             } else if (std::get_if<MsgReqMonitor::DBChange>(&newMsg.msg)) {
                 env.foreach_Event(txn, [&](auto &ev){
                     monitors.process(txn, ev, [&](RecipientList &&recipients, uint64_t levId){
-                        PackedEventView packed(ev.buf);
+                        std::optional<defaultDb::environment::View_Event> other;
+                        if (levId != ev.primaryKeyId) {
+                            other = env.lookup_Event(txn, levId);
+                            if (!other) return;
+                        }
+                        PackedEventView packed(other ? other->buf : ev.buf);
 
                         if (connIdToTenantId.size()) {
                             std::erase_if(recipients, [&](const auto &r){ return !tenantCanSee(*tenantSnap, r.connId, packed); });

@@ -231,6 +231,47 @@ tao::json::value tenantDetailJson(const TenantView &tenant) {
 }
 
 
+struct Forbidden : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+static TenantPtr ownTenant(const Bytes32 &pubkey) {
+    if (!cfg().banyan__owners__enabled) return nullptr;
+
+    for (const auto &t : TenantRegistry::get()->tenants) {
+        if (t->pubkey == pubkey) return t;
+    }
+
+    return nullptr;
+}
+
+// Owners share the server's harvester, so the admin bounds what they can ask of it
+static void checkOwnerPatch(const tao::json::value &patch) {
+    auto number = [](const tao::json::value &v){
+        return v.is_double() ? v.get_double() : v.is_signed() ? (double)v.get_signed() : v.is_unsigned() ? (double)v.get_unsigned() : -1.0;
+    };
+
+    for (const auto &[k, v] : patch.get_object()) {
+        if (k == "slug") {
+            throw Forbidden("only an admin can change the slug");
+        } else if (k == "primaryCircleSize" && number(v) > (double)cfg().banyan__owners__maxPrimaryCircleSize) {
+            throw herr("primaryCircleSize can be at most ", cfg().banyan__owners__maxPrimaryCircleSize);
+        } else if (k == "secondaryPerPeer" && number(v) > (double)cfg().banyan__owners__maxSecondaryPerPeer) {
+            throw herr("secondaryPerPeer can be at most ", cfg().banyan__owners__maxSecondaryPerPeer);
+        } else if (k == "pinned" && v.is_array() && v.get_array().size() > cfg().banyan__owners__maxPinned) {
+            throw herr("at most ", cfg().banyan__owners__maxPinned, " people can be pinned");
+        }
+    }
+}
+
+static tao::json::value ownerLimitsJson() {
+    return tao::json::value({
+        { "primaryCircleSize", cfg().banyan__owners__maxPrimaryCircleSize },
+        { "secondaryPerPeer", cfg().banyan__owners__maxSecondaryPerPeer },
+        { "pinned", cfg().banyan__owners__maxPinned },
+    });
+}
+
 static TenantPtr lookupTenant(const std::string &slugOrPubkey) {
     auto snap = TenantRegistry::get();
 
@@ -254,7 +295,9 @@ static bool patchAffectsTrust(const tao::json::value &patch) {
     return false;
 }
 
-static tao::json::value dispatchRpc(const std::string &method, const tao::json::value &params, const Bytes32 &signer) {
+static const std::vector<std::string> ownerMethods = { "supportedmethods", "whoami", "listtenants", "gettenant", "updatetenant", "recomputetrust" };
+
+static tao::json::value dispatchRpc(const std::string &method, const tao::json::value &params, const Bytes32 &signer, bool admin) {
     auto param = [&](size_t i) -> const tao::json::value & {
         if (i >= params.get_array().size()) throw herr("missing parameter ", i + 1);
         return params.get_array()[i];
@@ -266,16 +309,33 @@ static tao::json::value dispatchRpc(const std::string &method, const tao::json::
         return v.get_string();
     };
 
+    auto targetTenant = [&](size_t i){
+        auto t = lookupTenant(strParam(i));
+        if (!admin && t->pubkey != signer) throw Forbidden("you can only manage your own relay");
+        return t;
+    };
+
     if (method == "supportedmethods") {
+        if (!admin) {
+            tao::json::value output = tao::json::empty_array;
+            for (const auto &m : ownerMethods) output.emplace_back(m);
+            return output;
+        }
         return tao::json::value::array({ "supportedmethods", "whoami", "listtenants", "addtenant", "removetenant", "gettenant", "updatetenant", "recomputetrust", "harveststatus" });
     } else if (method == "whoami") {
-        return tao::json::value({
+        auto own = ownTenant(signer);
+        tao::json::value output = tao::json::value({
             { "pubkey", to_hex(signer.sv()) },
-            { "isAdmin", isAdmin(signer) },
+            { "isAdmin", admin },
+            { "tenant", own ? tao::json::value(own->slug) : tao::json::value(tao::json::null) },
         });
+        if (own) output["ownerLimits"] = ownerLimitsJson();
+        return output;
     } else if (method == "listtenants") {
         tao::json::value output = tao::json::empty_array;
-        for (const auto &t : TenantRegistry::get()->tenants) output.emplace_back(tenantSummaryJson(*t));
+        for (const auto &t : TenantRegistry::get()->tenants) {
+            if (admin || t->pubkey == signer) output.emplace_back(tenantSummaryJson(*t));
+        }
         return output;
     } else if (method == "addtenant") {
         auto pubkey = parsePubkey(strParam(0));
@@ -312,11 +372,12 @@ static tao::json::value dispatchRpc(const std::string &method, const tao::json::
         harvesterWake();
         return true;
     } else if (method == "gettenant") {
-        return tenantDetailJson(*lookupTenant(strParam(0)));
+        return tenantDetailJson(*targetTenant(0));
     } else if (method == "updatetenant") {
-        auto t = lookupTenant(strParam(0));
+        auto t = targetTenant(0);
         const auto &patch = param(1);
         if (!patch.is_object()) throw herr("parameter 2 must be an object");
+        if (!admin) checkOwnerPatch(patch);
 
         {
             auto txn = env.txn_rw();
@@ -332,7 +393,7 @@ static tao::json::value dispatchRpc(const std::string &method, const tao::json::
         if (!updated) throw herr("tenant disappeared");
         return tenantDetailJson(*updated);
     } else if (method == "recomputetrust") {
-        requestRecompute(lookupTenant(strParam(0))->id);
+        requestRecompute(targetTenant(0)->id);
         return true;
     } else if (method == "harveststatus") {
         return harvesterStatus();
@@ -375,10 +436,17 @@ HttpReply handleAdminRpc(const HttpRequestInfo &req) {
         return error(400, std::string("invalid request: ") + e.what());
     }
 
-    if (method != "whoami" && method != "supportedmethods" && !isAdmin(signer)) return error(403, "this pubkey is not an admin of this relay");
+    bool admin = isAdmin(signer);
+
+    if (!admin && method != "whoami" && method != "supportedmethods") {
+        bool ownerMethod = std::find(ownerMethods.begin(), ownerMethods.end(), method) != ownerMethods.end();
+        if (!ownerMethod || !ownTenant(signer)) return error(403, "this pubkey is not an admin of this relay");
+    }
 
     try {
-        return reply(200, tao::json::value({ { "result", dispatchRpc(method, params, signer) } }));
+        return reply(200, tao::json::value({ { "result", dispatchRpc(method, params, signer, admin) } }));
+    } catch (Forbidden &e) {
+        return error(403, e.what());
     } catch (std::exception &e) {
         return error(200, e.what());
     }
@@ -399,6 +467,7 @@ body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system
 main { max-width: 640px; margin: 0 auto; padding: 48px 16px; }
 h1 { font-size: 1.6rem; margin: 0 0 8px; }
 p { color: var(--muted); }
+a { color: var(--accent); }
 code { display: block; background: var(--card); padding: 12px; border-radius: 8px; color: var(--accent); overflow-wrap: anywhere; }
 </style></head><body><main>
 <h1>)" + htmlEscape(tenant.slug) + R"(</h1>
@@ -406,7 +475,8 @@ code { display: block; background: var(--card); padding: 12px; border-radius: 8p
         + std::to_string(tenant.universe.size()) + R"( people.</p>
 <p>Add this relay to your Nostr client:</p>
 <code>)" + htmlEscape(relayUrl) + R"(</code>
-</main></body></html>
+)" + (cfg().banyan__owners__enabled ? R"(<p>Is this your relay? <a href="/admin">Manage it</a> with your Nostr key.</p>
+)" : "") + R"(</main></body></html>
 )";
 
     HttpReply r;
