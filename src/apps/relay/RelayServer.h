@@ -54,6 +54,7 @@ struct MsgIngester : NonCopyable {
         uint64_t connId;
         std::string ipAddr;
         std::string payload;
+        uint64_t tenantId = 0;
     };
 
     struct CloseConn {
@@ -186,18 +187,19 @@ struct RelayServer {
     ThreadPool<MsgNegentropy> tpNegentropy;
     std::thread cronThread;
     std::thread signalHandlerThread;
+    std::thread banyanTrustThread;
+    std::thread banyanHarvesterThread;
 
     void run();
 
     void runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr);
 
     void runIngester(ThreadPool<MsgIngester>::Thread &thr);
-    void ingesterProcessEvent(lmdb::txn &txn, uint64_t connId, flat_hash_map<uint64_t, AuthSession*> &connIdToAuthStatus, std::string ipAddr, secp256k1_context *secpCtx, const tao::json::value &origJson, std::vector<MsgWriter> &output);
-    void ingesterProcessEvent(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, std::string ipAddr, const tao::json::value &origJson, std::vector<MsgWriter> &output);
-    void ingesterProcessReq(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, const tao::json::value &arr, bool countOnly, std::string &outSubIdStr);
+    void ingesterProcessEvent(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, uint64_t tenantId, std::string ipAddr, const tao::json::value &origJson, std::vector<MsgWriter> &output);
+    void ingesterProcessReq(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, uint64_t tenantId, const tao::json::value &arr, bool countOnly, std::string &outSubIdStr);
     void ingesterProcessClose(lmdb::txn &txn, uint64_t connId, const tao::json::value &arr);
-    void ingesterProcessAuth(RelayServerCtx &rsctx, uint64_t connId, const tao::json::value &eventJson);
-    void ingesterProcessNegentropy(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, const tao::json::value &origJson);
+    void ingesterProcessAuth(RelayServerCtx &rsctx, uint64_t connId, uint64_t tenantId, const tao::json::value &eventJson);
+    void ingesterProcessNegentropy(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, uint64_t tenantId, const tao::json::value &origJson);
 
     void runWriter(ThreadPool<MsgWriter>::Thread &thr);
 

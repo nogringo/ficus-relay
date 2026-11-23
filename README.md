@@ -2,6 +2,8 @@
 
 ![strfry logo](docs/strfry.svg)
 
+**This fork runs as a Banyan relay**: an admin adds people, and each one gets a virtual relay at `wss://host/<name>` filled with the notes of their trust circles. See [docs/banyan.md](docs/banyan.md).
+
 strfry is a relay for the [nostr protocol](https://github.com/nostr-protocol/nostr)
 
 * Supports most applicable NIPs: 1, 2, 4, 9, 11, 28, 40, 42, 45, 70, 77

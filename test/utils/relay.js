@@ -41,6 +41,10 @@ relay {
     maxSyncEvents = 100000
   }
 }
+
+banyan {
+  enabled = false
+}
 `;
 }
 

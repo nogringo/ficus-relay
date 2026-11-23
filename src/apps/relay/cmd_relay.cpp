@@ -4,6 +4,9 @@
 #include <docopt.h>
 
 #include "RelayServer.h"
+#include "apps/banyan/Tenants.h"
+#include "apps/banyan/TrustEngine.h"
+#include "apps/banyan/Harvester.h"
 
 
 static const char USAGE[] =
@@ -28,6 +31,16 @@ static void checkConfig() {
 
     if (cfg().events__rejectEphemeralEventsOlderThanSeconds >= cfg().events__ephemeralEventsLifetimeSeconds) {
         LW << "rejectEphemeralEventsOlderThanSeconds is >= ephemeralEventsLifetimeSeconds, which could result in unnecessary disk activity";
+    }
+
+    if (cfg().banyan__enabled) {
+        if (banyan::parsePubkeyList(cfg().banyan__admins).empty()) {
+            LW << "banyan.admins is empty: nobody can use the admin API or the /admin page";
+        }
+
+        if (cfg().relay__auth__serviceUrl.empty()) {
+            LW << "relay.auth.serviceUrl is not set: NIP-42 AUTH is disabled and NIP-98 checks use the Host header";
+        }
     }
 }
 
@@ -79,6 +92,21 @@ void RelayServer::run() {
     signalHandlerThread = std::thread([this]{
         runSignalHandler();
     });
+
+    if (cfg().banyan__enabled) {
+        banyan::TenantRegistry::reload();
+        LI << "Banyan: serving " << banyan::TenantRegistry::get()->tenants.size() << " virtual relays";
+
+        banyanTrustThread = std::thread([]{
+            banyan::runTrustEngine();
+        });
+
+        if (cfg().banyan__harvester__enabled) {
+            banyanHarvesterThread = std::thread([]{
+                banyan::runHarvester();
+            });
+        }
+    }
 
     // Monitor for config file reloads
 

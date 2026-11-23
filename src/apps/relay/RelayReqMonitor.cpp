@@ -2,6 +2,7 @@
 
 #include "ActiveMonitors.h"
 #include "ReadRestrictor.h"
+#include "apps/banyan/Tenants.h"
 
 
 
@@ -18,12 +19,22 @@ void RelayServer::runReqMonitor(ThreadPool<MsgReqMonitor>::Thread &thr) {
     Decompressor decomp;
     ActiveMonitors monitors;
     flat_hash_map<uint64_t, Bytes32> connIdToAuthedPubkey;
+    flat_hash_map<uint64_t, uint64_t> connIdToTenantId;
     uint64_t currEventId = MAX_U64;
+
+    // Looked up on every batch so universe changes apply to subscriptions that are already open
+    auto tenantCanSee = [&](const banyan::TenantSnapshot &snap, uint64_t connId, const PackedEventView &packed){
+        auto it = connIdToTenantId.find(connId);
+        if (it == connIdToTenantId.end()) return true;
+        auto tenant = snap.findById(it->second);
+        return tenant && tenant->canSee(packed);
+    };
 
     while (1) {
         auto newMsgs = thr.inbox.pop_all();
 
         auto txn = env.txn_ro();
+        auto tenantSnap = banyan::TenantRegistry::get();
 
         uint64_t latestEventId = getMostRecentLevId(txn);
         if (currEventId > latestEventId) currEventId = latestEventId;
@@ -33,10 +44,11 @@ void RelayServer::runReqMonitor(ThreadPool<MsgReqMonitor>::Thread &thr) {
                 auto connId = msg->sub.connId;
                 auto it = connIdToAuthedPubkey.find(connId);
                 Bytes32 connAuthedPubkey = it == connIdToAuthedPubkey.end() ? Bytes32() : it->second;
+                if (msg->sub.tenantId) connIdToTenantId[connId] = msg->sub.tenantId;
 
                 env.foreach_Event(txn, [&](auto &ev){
                     PackedEventView packed(ev.buf);
-                    if (msg->sub.filterGroup.doesMatch(packed)) {
+                    if (msg->sub.filterGroup.doesMatch(packed) && tenantCanSee(*tenantSnap, connId, packed)) {
                         if (ReadRestrictor::shouldSendToSubscriber(packed, connAuthedPubkey)) {
                             sendEvent(connId, msg->sub.subId, getEventJson(txn, decomp, ev.primaryKeyId));
                         }
@@ -56,11 +68,18 @@ void RelayServer::runReqMonitor(ThreadPool<MsgReqMonitor>::Thread &thr) {
                 monitors.removeSub(msg->connId, msg->subId);
             } else if (auto msg = std::get_if<MsgReqMonitor::CloseConn>(&newMsg.msg)) {
                 connIdToAuthedPubkey.erase(msg->connId);
+                connIdToTenantId.erase(msg->connId);
                 monitors.closeConn(msg->connId);
             } else if (std::get_if<MsgReqMonitor::DBChange>(&newMsg.msg)) {
                 env.foreach_Event(txn, [&](auto &ev){
                     monitors.process(txn, ev, [&](RecipientList &&recipients, uint64_t levId){
                         PackedEventView packed(ev.buf);
+
+                        if (connIdToTenantId.size()) {
+                            std::erase_if(recipients, [&](const auto &r){ return !tenantCanSee(*tenantSnap, r.connId, packed); });
+                            if (recipients.empty()) return;
+                        }
+
                         if (ReadRestrictor::restrictedKinds().contains(packed.kind())) {
                             RecipientList filteredRecipients;
                             for (const auto &recipient : recipients) {

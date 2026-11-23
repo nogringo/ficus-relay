@@ -1,0 +1,743 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>Banyan admin</title>
+<style>
+:root {
+  --bg: #f5f4ef; --surface: #ffffff; --surface-2: #eeede6; --text: #1c1f1b; --muted: #61665d; --border: #dddbd2;
+  --accent: #2d6a4a; --on-accent: #ffffff; --accent-soft: #e0eee5;
+  --danger: #b42318; --on-danger: #ffffff; --danger-soft: #fdecea; --ok: #2f8a55;
+  --c-owner: #7048b0; --c-pinned: #9a5a00; --c-primary: #2d6a4a; --c-secondary: #2f63a3;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --radius: 10px;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111311; --surface: #1a1d1a; --surface-2: #242824; --text: #e5e8e2; --muted: #9ba196; --border: #30352f;
+    --accent: #6cc093; --on-accent: #0c1a12; --accent-soft: #1d3326;
+    --danger: #f28b82; --on-danger: #2a0d0a; --danger-soft: #3a1c1a; --ok: #6cc093;
+    --c-owner: #c4a6f2; --c-pinned: #f0b357; --c-primary: #6cc093; --c-secondary: #8ab7ec;
+  }
+}
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-text-size-adjust: 100%; }
+a { color: var(--accent); }
+h1, h2 { margin: 0; line-height: 1.25; }
+h1 { font-size: 1.35rem; }
+h2 { font-size: 1.05rem; margin-bottom: 6px; }
+p { margin: 0 0 10px; }
+.top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 650; color: var(--text); text-decoration: none; }
+.brand svg { color: var(--accent); }
+nav { display: flex; gap: 4px; }
+nav a { padding: 5px 10px; border-radius: 8px; color: var(--muted); text-decoration: none; font-weight: 500; }
+nav a[aria-current] { background: var(--accent-soft); color: var(--text); }
+.who { margin-left: auto; display: flex; gap: 12px; align-items: center; font-size: .875rem; }
+main { max-width: 1040px; margin: 0 auto; padding: 16px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-bottom: 16px; min-width: 0; }
+.head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px; margin-bottom: 10px; }
+.head input { flex: 0 1 260px; }
+.grow { flex: 1 1 auto; min-width: 0; }
+.btns { display: flex; flex-wrap: wrap; gap: 8px; }
+.mono { font-family: var(--mono); font-size: .85em; overflow-wrap: anywhere; }
+.muted { color: var(--muted); }
+.small { font-size: .85rem; }
+.count { font-weight: 500; font-size: .9em; }
+.pad { padding: 12px 0; }
+.back { display: inline-block; margin-bottom: 12px; text-decoration: none; font-weight: 500; }
+.btn { font: inherit; font-weight: 600; border: 1px solid var(--accent); background: var(--accent); color: var(--on-accent); border-radius: 8px; padding: 7px 14px; cursor: pointer; white-space: nowrap; }
+.btn:disabled { opacity: .6; cursor: progress; }
+.btn.ghost { background: transparent; color: var(--text); border-color: var(--border); }
+.btn.ghost:hover { border-color: var(--muted); }
+.btn.sm { padding: 3px 10px; font-size: .82rem; font-weight: 500; }
+.btn.warn { color: var(--danger); }
+.btn.danger { background: var(--danger); border-color: var(--danger); color: var(--on-danger); }
+.copy { min-width: 5.6em; }
+input { font: inherit; font-size: 16px; width: 100%; min-width: 0; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
+input:focus, .btn:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.msg { margin: 10px 0 0; padding: 8px 10px; border-radius: 8px; font-size: .9rem; overflow-wrap: anywhere; }
+.msg.err { background: var(--danger-soft); color: var(--danger); }
+.msg.info { background: var(--accent-soft); }
+.note { background: var(--surface-2); padding: 10px 12px; border-radius: 8px; }
+.login { max-width: 460px; margin: 40px auto; }
+.login p { color: var(--muted); }
+.add { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; gap: 10px; align-items: end; }
+.field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.field > span { font-size: .85rem; font-weight: 600; }
+.field small, .hint { color: var(--muted); font-size: .8rem; line-height: 1.35; }
+.fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; margin-bottom: 6px; }
+fieldset { border: 0; padding: 0; margin: 0 0 18px; min-width: 0; }
+legend { font-weight: 650; padding: 0; margin-bottom: 8px; }
+.tlist { display: grid; gap: 8px; }
+.tenant { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, .7fr) minmax(0, 1.6fr); gap: 12px; align-items: center; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; cursor: pointer; }
+.tenant:hover { border-color: var(--accent); }
+.tenant > div { display: flex; flex-direction: column; min-width: 0; }
+.tenant > .url-row { flex-direction: row; }
+.slug { font-weight: 650; font-size: 1.05rem; color: var(--text); text-decoration: none; overflow-wrap: anywhere; }
+.slug:hover { color: var(--accent); }
+.url-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.url-row code { flex: 1; min-width: 0; font-family: var(--mono); font-size: .8rem; background: var(--surface-2); padding: 4px 8px; border-radius: 6px; overflow-wrap: anywhere; cursor: text; }
+.empty { padding: 24px; text-align: center; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin: 12px 0; }
+.stat { background: var(--surface-2); border-radius: 8px; padding: 8px 12px; display: flex; flex-direction: column; }
+.stat b { font-size: 1.2rem; font-variant-numeric: tabular-nums; }
+.stat span { font-size: .8rem; color: var(--muted); }
+.urls { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 12px; align-items: center; }
+.cols { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 16px; align-items: start; margin-bottom: 16px; }
+.cols > .card { margin-bottom: 0; }
+.inline-form { display: flex; gap: 8px; }
+.pk-list { list-style: none; margin: 8px 0 18px; padding: 0; }
+.pk-list:last-child { margin-bottom: 0; }
+.pk-list li { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.pk-list li:last-child { border-bottom: 0; }
+.pk-list .id { flex: 1; }
+.pk-list .av { width: 28px; height: 28px; font-size: .8rem; }
+.id { display: flex; flex-direction: column; min-width: 0; }
+.name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.via { font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }
+.av { width: 36px; height: 36px; flex: none; border-radius: 50%; object-fit: cover; display: inline-flex; align-items: center; justify-content: center; background: hsl(var(--h, 140) 35% 48%); color: #fff; font-weight: 600; font-size: .9rem; }
+details { border-top: 1px solid var(--border); }
+summary { cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 10px 0; list-style: none; }
+summary::-webkit-details-marker { display: none; }
+summary::before { content: ""; border-left: 5px solid var(--muted); border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform .15s; }
+details[open] > summary::before { transform: rotate(90deg); }
+.chip { display: inline-block; padding: 1px 10px; border-radius: 999px; font-size: .8rem; font-weight: 600; border: 1px solid currentColor; }
+.chip.owner { color: var(--c-owner); } .chip.pinned { color: var(--c-pinned); }
+.chip.primary { color: var(--c-primary); } .chip.secondary { color: var(--c-secondary); }
+.members { list-style: none; margin: 0 0 8px; padding: 0; }
+.member { display: grid; grid-template-columns: 36px minmax(0, 1fr) auto auto; gap: 10px; align-items: center; padding: 6px 0; }
+.member + .member { border-top: 1px dashed var(--border); }
+.score { font-family: var(--mono); font-size: .85rem; font-variant-numeric: tabular-nums; color: var(--muted); }
+.acts { display: flex; gap: 6px; justify-content: flex-end; }
+.danger-zone { border-color: var(--danger-soft); }
+.relays { display: grid; gap: 8px; }
+.relay { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; }
+.r-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.r-head .mono { flex: 1; min-width: 0; font-weight: 600; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); flex: none; }
+.relay.on .dot { background: var(--ok); }
+.state { font-size: .8rem; color: var(--muted); }
+.kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin: 10px 0 0; }
+.kv div { display: flex; flex-direction: column; }
+.kv dt { font-size: .78rem; color: var(--muted); }
+.kv dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+.r-err { margin: 8px 0 0; color: var(--danger); font-family: var(--mono); font-size: .8rem; overflow-wrap: anywhere; }
+@media (max-width: 820px) {
+  .cols { grid-template-columns: minmax(0, 1fr); }
+  .tenant { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .tenant > .url-row { grid-column: 1 / -1; }
+}
+@media (max-width: 560px) {
+  .add, .urls, .tenant { grid-template-columns: minmax(0, 1fr); }
+  .member { grid-template-columns: 36px minmax(0, 1fr) auto; }
+  .acts { grid-column: 2 / -1; justify-content: flex-start; }
+  .head input { flex: 1 1 100%; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/">
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><circle cx="12" cy="8" r="6"/><circle cx="5.5" cy="11" r="4"/><circle cx="18.5" cy="11" r="4"/><rect x="11" y="12" width="2" height="10"/><rect x="5" y="13" width="1.5" height="9"/><rect x="17.5" y="13" width="1.5" height="9"/></svg>
+    Banyan admin
+  </a>
+  <nav id="nav" hidden><a href="#/" data-nav="people">People</a><a href="#/harvest" data-nav="harvest">Harvester</a></nav>
+  <div class="who" id="who" hidden><span class="mono" id="who-npub"></span><a href="#" data-act="logout">Log out</a></div>
+</header>
+<main id="app"><p class="muted pad">Loading...</p></main>
+<script>
+"use strict";
+const KEY = "banyan-admin-pubkey";
+const S = { pubkey: null, admin: false, nav: 0, tenants: null, tenant: null, byPk: new Map(), filter: "" };
+const $ = sel => document.querySelector(sel);
+const app = $("#app");
+const WEIGHTS = ["reply", "repost", "reaction", "zap", "mention"];
+const CIRCLES = [["owner", "Owner"], ["pinned", "Pinned"], ["primary", "Primary circle"], ["secondary", "Secondary circle"]];
+const LOADING = '<p class="muted pad">Loading...</p>';
+const BACK = '<a class="back" href="#/">&larr; All people</a>';
+const BAD_PK = "Enter a valid npub or a 64-character hex pubkey.";
+const RTF = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
+
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const fmt = n => (Number.isFinite(+n) ? +n : 0).toLocaleString("en");
+const cap = s => s[0].toUpperCase() + s.slice(1);
+const errText = e => (e && e.message) || String(e);
+const short = v => { const n = String(v ?? ""); return n.length > 24 ? n.slice(0, 12) + "..." + n.slice(-6) : n; };
+const safeDecode = s => { try { return decodeURIComponent(s); } catch { return s; } };
+const wsBase = () => (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/";
+const relayUrl = t => t.relayUrl || wsBase() + t.slug;
+const npubOf = t => t.npub || npubEncode(t.pubkey);
+const when = ts => (ts ? new Date(ts * 1000).toLocaleString("en", { dateStyle: "medium", timeStyle: "short" }) : "");
+
+function ago(ts) {
+  if (!ts) return "never";
+  const d = ts - Date.now() / 1000;
+  for (const [unit, sec] of [["year", 31536000], ["month", 2592000], ["week", 604800], ["day", 86400], ["hour", 3600], ["minute", 60]]) {
+    if (Math.abs(d) >= sec) return RTF.format(Math.trunc(d / sec), unit);
+  }
+  return "just now";
+}
+
+function slugError(s) {
+  if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(s)) return "The slug must be 1 to 32 characters: lowercase letters, digits, '-' or '_', starting with a letter or digit.";
+  if (s.startsWith("npub1")) return "The slug cannot start with npub1.";
+  return "";
+}
+
+const BECH = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+function polymod(values) {
+  const gen = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let chk = 1;
+  for (const v of values) {
+    const top = chk >>> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) if ((top >>> i) & 1) chk ^= gen[i];
+  }
+  return chk;
+}
+function hrpExpand(hrp) {
+  const codes = [...hrp].map(c => c.charCodeAt(0));
+  return [...codes.map(c => c >> 5), 0, ...codes.map(c => c & 31)];
+}
+function convertBits(data, from, to, pad) {
+  let acc = 0, bits = 0;
+  const out = [], max = (1 << to) - 1;
+  for (const v of data) {
+    acc = ((acc << from) | v) & 0xffffff;
+    bits += from;
+    while (bits >= to) { bits -= to; out.push((acc >> bits) & max); }
+  }
+  if (pad && bits) out.push((acc << (to - bits)) & max);
+  else if (!pad && (bits >= from || ((acc << (to - bits)) & max))) return null;
+  return out;
+}
+function npubEncode(hex) {
+  if (!/^[0-9a-f]{64}$/i.test(hex || "")) return String(hex ?? "");
+  const data = convertBits(hex.match(/../g).map(h => parseInt(h, 16)), 8, 5, true);
+  const mod = polymod([...hrpExpand("npub"), ...data, 0, 0, 0, 0, 0, 0]) ^ 1;
+  let out = "npub1";
+  for (const d of data) out += BECH[d];
+  for (let i = 0; i < 6; i++) out += BECH[(mod >>> (5 * (5 - i))) & 31];
+  return out;
+}
+function npubDecode(str) {
+  const s = String(str ?? "").trim();
+  if (s !== s.toLowerCase() && s !== s.toUpperCase()) return null;
+  const low = s.toLowerCase();
+  if (!low.startsWith("npub1") || low.length > 90) return null;
+  const data = [...low.slice(5)].map(c => BECH.indexOf(c));
+  if (data.length < 6 || data.includes(-1) || polymod([...hrpExpand("npub"), ...data]) !== 1) return null;
+  const bytes = convertBits(data.slice(0, -6), 5, 8, false);
+  return bytes && bytes.length === 32 ? bytes.map(b => b.toString(16).padStart(2, "0")).join("") : null;
+}
+function toHex(input) {
+  const s = String(input ?? "").trim();
+  return /^[0-9a-f]{64}$/i.test(s) ? s.toLowerCase() : npubDecode(s);
+}
+
+let lastSignedAt = 0;
+const hexOf = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+function b64(str) {
+  let bin = "";
+  for (const b of new TextEncoder().encode(str)) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+async function rpc(method, params = []) {
+  if (!window.nostr) throw new Error("No NIP-07 extension found.");
+  if (!crypto.subtle) throw new Error("Open this page over https (or on localhost): the browser only hashes requests in a secure context.");
+  const url = location.origin + "/", body = JSON.stringify({ method, params });
+  const payload = hexOf(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)));
+  // The relay refuses a reused event id, and the same request twice in one second would sign identical events.
+  const createdAt = lastSignedAt = Math.max(Math.floor(Date.now() / 1000), lastSignedAt + 1);
+  let evt, res, data;
+  try {
+    evt = await window.nostr.signEvent({ kind: 27235, created_at: createdAt, content: "", tags: [["u", url], ["method", "POST"], ["payload", payload]] });
+  } catch (e) { throw new Error("The extension did not sign the request: " + errText(e)); }
+  try {
+    res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/nostr+json+rpc", Authorization: "Nostr " + b64(JSON.stringify(evt)) }, body });
+  } catch (e) { throw new Error("Could not reach the relay: " + errText(e)); }
+  try { data = await res.json(); } catch { throw new Error(`The relay answered HTTP ${res.status} without JSON.`); }
+  if (data && data.error) throw new Error(String(data.error));
+  if (!res.ok) throw new Error(`The relay answered HTTP ${res.status}.`);
+  return data ? data.result : null;
+}
+
+function setMsg(key, text, kind = "err") {
+  for (const el of document.querySelectorAll(`[data-msg="${key}"]`)) {
+    el.textContent = text || "";
+    el.className = "msg " + kind;
+    el.hidden = !text;
+  }
+}
+function flash(btn, text) {
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  btn.textContent = text;
+  clearTimeout(btn._flash);
+  btn._flash = setTimeout(() => { btn.textContent = btn.dataset.label; delete btn.dataset.label; }, 1500);
+}
+async function act(btn, busy, key, fn) {
+  setMsg(key, "");
+  const label = btn.dataset.label || btn.textContent;
+  btn.disabled = true;
+  if (busy) btn.textContent = busy;
+  let done;
+  try { done = await fn(); } catch (e) { setMsg(key, errText(e)); }
+  btn.disabled = false;
+  btn.textContent = label;
+  if (typeof done === "string") flash(btn, done);
+}
+async function copyText(btn) {
+  const text = btn.dataset.copy;
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.cssText = "position:fixed;opacity:0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { ok = document.execCommand("copy"); } catch {}
+    ta.remove();
+  }
+  flash(btn, ok ? "Copied" : "Failed");
+}
+
+function httpsUrl(u) {
+  try { const x = new URL(u); return x.protocol === "https:" ? x.href : null; } catch { return null; }
+}
+function avatar(m) {
+  const hue = (parseInt(String(m.pubkey).slice(0, 4), 16) || 0) % 360, pic = httpsUrl(m.picture);
+  if (pic) return `<img class="av" style="--h:${hue}" src="${esc(pic)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">`;
+  return `<span class="av" style="--h:${hue}" aria-hidden="true">${esc(([...String(m.name || "").trim()][0] || "").toUpperCase())}</span>`;
+}
+function nameOf(pk) {
+  const m = S.byPk.get(pk);
+  return (m && m.name) || short(npubEncode(pk));
+}
+function idCell(pk, m, extra = "") {
+  const n = (m && m.npub) || npubEncode(pk), name = m && m.name;
+  return `<div class="id" title="${esc(n)}"><span class="name${name ? "" : " mono"}">${esc(name || short(n))}</span>${name ? `<span class="mono muted small">${esc(short(n))}</span>` : ""}${extra}</div>`;
+}
+const urlRow = u => `<div class="url-row"><code>${esc(u)}</code><button class="btn ghost sm copy" data-act="copy" data-copy="${esc(u)}">Copy</button></div>`;
+
+function store(pk) { try { if (pk) sessionStorage.setItem(KEY, pk); else sessionStorage.removeItem(KEY); } catch {} }
+function stored() { try { return sessionStorage.getItem(KEY); } catch { return null; } }
+async function waitNostr() {
+  // Extensions often inject window.nostr shortly after the page loads.
+  for (let i = 0; i < 15 && !window.nostr; i++) await new Promise(r => setTimeout(r, 100));
+  return !!window.nostr;
+}
+
+function setHeader() {
+  $("#who").hidden = !S.pubkey;
+  $("#nav").hidden = !S.admin;
+  if (!S.pubkey) return;
+  const n = npubEncode(S.pubkey), el = $("#who-npub");
+  el.textContent = short(n);
+  el.title = n;
+}
+function renderLogin(msg) {
+  S.nav++;
+  S.pubkey = null;
+  S.admin = false;
+  setHeader();
+  app.innerHTML = `<section class="card login">
+  <h1>Sign in</h1>
+  <p>Manage the people hosted on this relay and their virtual relays. Sign in with the Nostr key of a relay admin.</p>
+  ${window.nostr
+    ? '<button class="btn" data-act="login">Log in with extension</button>'
+    : '<p class="note">Signing in needs a NIP-07 browser extension, like Alby or nos2x, that holds your Nostr key. Install one, then reload this page.</p>'}
+  <p class="msg" data-msg="login" hidden></p>
+</section>`;
+  if (msg) setMsg("login", msg);
+}
+function login(btn) {
+  return act(btn, "Waiting for extension...", "login", async () => enter(await window.nostr.getPublicKey()));
+}
+function logout() {
+  store(null);
+  renderLogin();
+}
+async function enter(pk) {
+  S.pubkey = pk;
+  S.admin = false;
+  setHeader();
+  const tok = ++S.nav;
+  app.innerHTML = '<p class="muted pad">Checking access...</p>';
+  let me;
+  try { me = await rpc("whoami", []); } catch (e) {
+    if (tok === S.nav) { store(null); renderLogin(errText(e)); }
+    return;
+  }
+  if (tok !== S.nav) return;
+  S.pubkey = (me && me.pubkey) || pk;
+  S.admin = !!(me && me.isAdmin);
+  store(S.pubkey);
+  setHeader();
+  if (S.admin) route();
+  else app.innerHTML = '<section class="card login"><p>This pubkey is not an admin of this relay.</p></section>';
+}
+
+function route() {
+  if (!S.admin) return;
+  const h = location.hash.slice(1) || "/", m = h.match(/^\/t\/(.+)$/);
+  const tab = h === "/harvest" ? "harvest" : "people";
+  document.querySelectorAll("[data-nav]").forEach(a => {
+    if (a.dataset.nav === tab) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
+  });
+  if (m) showTenant(safeDecode(m[1]));
+  else if (h === "/harvest") showHarvest();
+  else showTenants();
+}
+
+async function showTenants() {
+  const tok = ++S.nav;
+  app.innerHTML = `<section class="card">
+  <h1>People <span class="muted count" id="t-count"></span></h1>
+  <p class="muted small">Each person gets a virtual relay that only serves events from their universe: themselves, the people they pin, and their trust circles.</p>
+  <form id="add-form" class="add" novalidate>
+    <label class="field"><span>Pubkey</span><input name="pubkey" placeholder="npub1... or 64-character hex" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+    <label class="field"><span>Slug</span><input name="slug" placeholder="alice" maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+    <button class="btn">Add person</button>
+  </form>
+  <p class="msg" data-msg="add" hidden></p>
+</section>
+<section id="tenant-list">${LOADING}</section>`;
+  try {
+    const list = await rpc("listtenants", []);
+    if (tok !== S.nav) return;
+    S.tenants = Array.isArray(list) ? list : [];
+    paintTenants();
+  } catch (e) {
+    if (tok === S.nav) $("#tenant-list").innerHTML = `<p class="msg err">${esc(errText(e))}</p>`;
+  }
+}
+function paintTenants() {
+  const box = $("#tenant-list");
+  if (!box) return;
+  const list = [...S.tenants].sort((a, b) => String(a.slug).localeCompare(String(b.slug)));
+  $("#t-count").textContent = fmt(list.length);
+  box.innerHTML = list.length
+    ? `<div class="tlist">${list.map(tenantCard).join("")}</div>`
+    : '<p class="muted empty">Nobody here yet. Add a person above to give them a virtual relay.</p>';
+}
+function tenantCard(t) {
+  const href = esc("#/t/" + encodeURIComponent(t.slug)), n = npubOf(t);
+  return `<article class="tenant" data-href="${href}">
+  <div><a class="slug" href="${href}">${esc(t.slug)}</a><span class="mono muted small" title="${esc(n)}">${esc(short(n))}</span></div>
+  <div><span><b>${fmt(t.universeSize)}</b> in universe</span><span class="muted small">${fmt(t.primaryCount)} primary, ${fmt(t.secondaryCount)} secondary, ${fmt(t.pinnedCount)} pinned</span></div>
+  <div class="small"><span class="muted">Trust computed</span><span title="${esc(when(t.computedAt))}">${esc(ago(t.computedAt))}</span></div>
+  ${urlRow(relayUrl(t))}
+</article>`;
+}
+async function addTenant(form) {
+  const f = form.elements, raw = f.pubkey.value.trim(), slug = f.slug.value.trim();
+  if (!toHex(raw)) return setMsg("add", BAD_PK);
+  const bad = slugError(slug);
+  if (bad) return setMsg("add", bad);
+  await act(form.querySelector("button"), "Adding...", "add", async () => {
+    const t = await rpc("addtenant", [raw, slug]);
+    form.reset();
+    S.tenants = (S.tenants || []).filter(x => x.pubkey !== t.pubkey).concat(t);
+    paintTenants();
+  });
+}
+
+function detailShell() {
+  const field = (name, label, attrs, hint = "") => `<label class="field"><span>${label}</span><input name="${name}" ${attrs}>${hint && `<small>${hint}</small>`}</label>`;
+  const num = 'type="number" step="any" inputmode="decimal"', int = 'type="number" min="0" step="1" inputmode="numeric"';
+  const listEditor = (kind, form, title, hint, verb) => `<h2>${title}</h2><p class="muted small">${hint}</p>
+    <form id="${form}" class="inline-form" novalidate><input name="pk" placeholder="npub1... or hex pubkey" aria-label="${verb} a pubkey" autocomplete="off" autocapitalize="none" spellcheck="false"><button class="btn ghost">${verb}</button></form>
+    <p class="msg" data-msg="${kind}" hidden></p>
+    <ul class="pk-list" id="${kind}-list" data-zone="${kind}"></ul>`;
+  return `${BACK}
+<section class="card">
+  <div class="head">
+    <div class="grow"><h1 id="t-title"></h1><div class="mono muted small" id="t-npub"></div></div>
+    <div class="btns"><button class="btn" data-act="recompute">Recompute trust</button><button class="btn ghost" data-act="refresh">Refresh</button></div>
+  </div>
+  <p class="msg" data-msg="head" hidden></p>
+  <div id="t-summary"></div>
+</section>
+<div class="cols">
+  <section class="card">
+    <h2>Trust settings</h2>
+    <form id="settings-form" novalidate>
+      <fieldset><legend>Interaction weights</legend>
+        <div class="fields">${WEIGHTS.map(w => field("w_" + w, cap(w), num)).join("")}</div>
+        <small class="hint">How much each kind of interaction counts toward a peer's score.</small>
+      </fieldset>
+      <fieldset><legend>Circles</legend><div class="fields">
+        ${field("primaryCircleSize", "Primary circle size", int, "Top peers of the owner.")}
+        ${field("secondaryPerPeer", "Secondary per peer", int, "Top peers taken from each primary member.")}
+        ${field("minScore", "Minimum score", num, "Peers scoring below this are left out.")}
+      </div></fieldset>
+      <fieldset><legend>Relay path</legend><div class="fields">
+        ${field("slug", "Slug", 'maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false"', "Changing it changes the relay URL. The npub URL keeps working.")}
+      </div></fieldset>
+      <button class="btn">Save</button>
+      <p class="msg" data-msg="settings" hidden></p>
+    </form>
+  </section>
+  <section class="card">
+    ${listEditor("pinned", "pin-form", "Pinned", "Always in the universe, whatever their score.", "Pin")}
+    ${listEditor("blocked", "block-form", "Blocked", "Never in the universe, even with a high score.", "Block")}
+  </section>
+</div>
+<section class="card">
+  <div class="head"><h2 class="grow">Universe <span class="muted count" id="m-count"></span></h2><input id="member-filter" type="search" placeholder="Filter by name or npub" aria-label="Filter members" autocomplete="off"></div>
+  <p class="msg" data-msg="members" hidden></p>
+  <div id="t-members" data-zone="members"></div>
+</section>
+<section class="card danger-zone">
+  <h2>Remove person</h2>
+  <p class="muted small">Their virtual relay stops serving events. You can add them again later.</p>
+  <button class="btn danger" data-act="remove">Remove person</button>
+  <p class="msg" data-msg="remove" hidden></p>
+</section>`;
+}
+async function showTenant(id) {
+  const tok = ++S.nav;
+  app.innerHTML = BACK + LOADING;
+  try {
+    const t = await rpc("gettenant", [id]);
+    if (tok !== S.nav) return;
+    S.filter = "";
+    app.innerHTML = detailShell();
+    applyTenant(t, true);
+  } catch (e) {
+    if (tok === S.nav) app.innerHTML = `${BACK}<p class="msg err">${esc(errText(e))}</p>`;
+  }
+}
+function applyTenant(t, withSettings) {
+  S.tenant = t;
+  S.byPk = new Map((t.members || []).map(m => [m.pubkey, m]));
+  if (!$("#t-summary")) return;
+  $("#t-title").textContent = t.slug;
+  $("#t-npub").textContent = npubOf(t);
+  $("#t-summary").innerHTML = summaryHtml(t);
+  paintList("pinned");
+  paintList("blocked");
+  paintMembers();
+  if (withSettings) fillSettings(t.settings || {});
+}
+async function tenantRpc(method, params, withSettings) {
+  const tok = S.nav, t = await rpc(method, params);
+  if (tok === S.nav) applyTenant(t, withSettings);
+  return tok === S.nav;
+}
+const refreshTenant = () => tenantRpc("gettenant", [S.tenant.pubkey], false);
+
+function summaryHtml(t) {
+  const url = relayUrl(t), n = npubOf(t);
+  const alt = url.endsWith("/" + t.slug) ? url.slice(0, -t.slug.length) + n : wsBase() + n;
+  const stat = (v, label, title = "") => `<div class="stat"${title ? ` title="${esc(title)}"` : ""}><b>${v}</b><span>${label}</span></div>`;
+  return `<div class="stats">${stat(fmt(t.universeSize), "In universe")}${stat(fmt(t.primaryCount), "Primary")}${stat(fmt(t.secondaryCount), "Secondary")}${stat(fmt(t.pinnedCount), "Pinned")}${stat(esc(ago(t.computedAt)), "Trust computed", when(t.computedAt))}</div>
+<div class="urls"><span class="muted small">Relay URL</span>${urlRow(url)}<span class="muted small">Also at</span>${urlRow(alt)}<span class="muted small">Added</span><span class="small">${esc(when(t.addedAt) || "unknown")}</span></div>`;
+}
+function fillSettings(s) {
+  const f = $("#settings-form").elements, w = s.weights || {};
+  for (const k of WEIGHTS) f["w_" + k].value = w[k] ?? "";
+  for (const k of ["primaryCircleSize", "secondaryPerPeer", "minScore"]) f[k].value = s[k] ?? "";
+  f.slug.value = S.tenant.slug;
+}
+function paintList(kind) {
+  const ul = $(`#${kind}-list`);
+  if (!ul) return;
+  const pks = (S.tenant.settings || {})[kind] || [], verb = kind === "pinned" ? "unpin" : "unblock";
+  ul.innerHTML = pks.length
+    ? pks.map(pk => `<li>${avatar(S.byPk.get(pk) || { pubkey: pk })}${idCell(pk, S.byPk.get(pk))}<button class="btn ghost sm" data-act="${verb}" data-pk="${esc(pk)}">Remove</button></li>`).join("")
+    : `<li class="muted small">${kind === "pinned" ? "Nobody pinned." : "Nobody blocked."}</li>`;
+}
+function paintMembers() {
+  const box = $("#t-members");
+  if (!box) return;
+  const was = {};
+  box.querySelectorAll("details").forEach(d => { was[d.dataset.c] = d.open; });
+  const s = S.tenant.settings || {}, pinned = new Set(s.pinned || []), blocked = new Set(s.blocked || []);
+  const q = S.filter.toLowerCase(), members = S.tenant.members || [];
+  const shown = q ? members.filter(m => [m.name, m.npub, m.pubkey].some(x => String(x || "").toLowerCase().includes(q))) : members;
+  $("#m-count").textContent = q ? `${fmt(shown.length)} of ${fmt(members.length)}` : fmt(members.length);
+  box.innerHTML = CIRCLES.map(([c, title]) => {
+    const list = shown.filter(m => m.circle === c).sort((a, b) => (+b.score || 0) - (+a.score || 0));
+    if (!list.length) return "";
+    // Secondary circles can hold thousands of people, so keep big ones folded until asked.
+    const open = q || (was[c] ?? (c !== "secondary" || list.length <= 100));
+    return `<details data-c="${c}"${open ? " open" : ""}><summary><span class="chip ${c}">${title}</span><span class="muted small">${fmt(list.length)}</span></summary><ul class="members">${list.map(m => memberRow(m, pinned, blocked)).join("")}</ul></details>`;
+  }).join("") || `<p class="muted">${q ? "Nobody matches this filter." : "The universe is empty. Use Recompute trust to build it."}</p>`;
+}
+function memberRow(m, pinned, blocked) {
+  const pk = esc(m.pubkey), p = pinned.has(m.pubkey), b = blocked.has(m.pubkey), owner = m.circle === "owner";
+  const via = m.circle === "secondary" && Array.isArray(m.via) && m.via.length
+    ? `<span class="via">via ${esc(m.via.slice(0, 3).map(nameOf).join(", "))}${m.via.length > 3 ? ` and ${m.via.length - 3} more` : ""}</span>`
+    : "";
+  const acts = owner ? "" : `<button class="btn ghost sm" data-act="${p ? "unpin" : "pin"}" data-pk="${pk}">${p ? "Unpin" : "Pin"}</button><button class="btn ghost sm warn" data-act="${b ? "unblock" : "block"}" data-pk="${pk}">${b ? "Unblock" : "Block"}</button>`;
+  const sc = m.score == null ? NaN : +m.score, score = !owner && Number.isFinite(sc) ? sc.toFixed(2) : "";
+  return `<li class="member">${avatar(m)}${idCell(m.pubkey, m, via)}<span class="score" title="Trust score">${score}</span><div class="acts">${acts}</div></li>`;
+}
+
+// Pinned and blocked exclude each other, so moving a pubkey into one list takes it out of the other.
+function listsWith(kind, pk, add) {
+  const s = S.tenant.settings || {};
+  let pinned = (s.pinned || []).filter(x => x !== pk), blocked = (s.blocked || []).filter(x => x !== pk);
+  if (add && kind === "pinned") pinned.push(pk);
+  if (add && kind === "blocked") blocked.push(pk);
+  return { pinned, blocked };
+}
+function toggle(btn, kind, add) {
+  const zone = btn.closest("[data-zone]");
+  return act(btn, "", zone ? zone.dataset.zone : "members", () => tenantRpc("updatetenant", [S.tenant.pubkey, listsWith(kind, btn.dataset.pk, add)], false));
+}
+async function addToList(form, kind) {
+  const input = form.elements.pk, hex = toHex(input.value);
+  if (!hex) return setMsg(kind, BAD_PK);
+  if (((S.tenant.settings || {})[kind] || []).includes(hex)) return setMsg(kind, kind === "pinned" ? "Already pinned." : "Already blocked.");
+  await act(form.querySelector("button"), "", kind, async () => {
+    await tenantRpc("updatetenant", [S.tenant.pubkey, listsWith(kind, hex, true)], false);
+    input.value = "";
+  });
+}
+async function saveSettings(form) {
+  const f = form.elements, patch = { weights: {} };
+  const read = (name, label, int) => {
+    const raw = f[name].value.trim(), v = Number(raw);
+    if (raw === "" || !Number.isFinite(v)) throw new Error(`${label} must be a number.`);
+    if (int && (!Number.isInteger(v) || v < 0)) throw new Error(`${label} must be a whole number, 0 or more.`);
+    return v;
+  };
+  try {
+    for (const w of WEIGHTS) patch.weights[w] = read("w_" + w, cap(w) + " weight", false);
+    patch.primaryCircleSize = read("primaryCircleSize", "Primary circle size", true);
+    patch.secondaryPerPeer = read("secondaryPerPeer", "Secondary per peer", true);
+    patch.minScore = read("minScore", "Minimum score", false);
+    const slug = f.slug.value.trim();
+    if (slug !== S.tenant.slug) {
+      const bad = slugError(slug);
+      if (bad) throw new Error(bad);
+      patch.slug = slug;
+    }
+  } catch (e) { return setMsg("settings", e.message); }
+  await act(form.querySelector("button"), "Saving...", "settings", async () => {
+    const current = await tenantRpc("updatetenant", [S.tenant.pubkey, patch], true);
+    if (current && patch.slug) history.replaceState(null, "", "#/t/" + encodeURIComponent(S.tenant.slug));
+    return "Saved";
+  });
+}
+async function recompute(btn) {
+  const tok = S.nav, before = S.tenant.computedAt;
+  await act(btn, "Starting...", "head", async () => {
+    await rpc("recomputetrust", [S.tenant.pubkey]);
+    setMsg("head", "Recomputing in the background. This page refreshes in a few seconds.", "info");
+    setTimeout(async () => {
+      if (tok !== S.nav) return;
+      try {
+        await refreshTenant();
+        if (tok === S.nav) setMsg("head", S.tenant.computedAt === before ? "Still computing. Use Refresh in a moment." : "", "info");
+      } catch (e) { if (tok === S.nav) setMsg("head", errText(e)); }
+    }, 5000);
+  });
+}
+async function removeTenant(btn) {
+  const t = S.tenant;
+  if (!confirm(`Remove ${t.slug}? Their virtual relay ${relayUrl(t)} will stop serving events.`)) return;
+  await act(btn, "Removing...", "remove", async () => {
+    await rpc("removetenant", [t.pubkey]);
+    location.hash = "#/";
+  });
+}
+
+async function showHarvest() {
+  ++S.nav;
+  app.innerHTML = `<section class="card">
+  <div class="head"><h1 class="grow">Harvester</h1><button class="btn ghost" data-act="harvest">Refresh</button></div>
+  <p class="muted small">The harvester fetches the events of every universe from other relays.</p>
+  <p class="msg" data-msg="harvest" hidden></p>
+  <div id="harvest">${LOADING}</div>
+</section>`;
+  try { await loadHarvest(); } catch (e) {
+    setMsg("harvest", errText(e));
+    const box = $("#harvest");
+    if (box) box.innerHTML = "";
+  }
+}
+async function loadHarvest() {
+  const tok = S.nav, h = (await rpc("harveststatus", [])) || {};
+  const box = $("#harvest");
+  if (tok !== S.nav || !box) return;
+  const relays = Array.isArray(h.relays) ? h.relays : [], on = relays.filter(r => r.connected).length;
+  box.innerHTML = `<p class="small">${fmt(h.targets)} pubkeys targeted, ${fmt(on)} of ${fmt(relays.length)} relays connected. <span class="muted">Updated ${esc(new Date().toLocaleTimeString("en"))}.</span></p>`
+    + (relays.length ? `<div class="relays">${relays.map(relayRow).join("")}</div>` : '<p class="muted empty">No relays in use yet.</p>');
+}
+function relayRow(r) {
+  const stats = [["Subscriptions", r.subs], ["Authors", r.authors], ["Inbox targets", r.inboxTargets], ["Events received", r.eventsReceived]];
+  return `<article class="relay ${r.connected ? "on" : "off"}">
+  <div class="r-head"><span class="dot"></span><span class="mono">${esc(r.url)}</span><span class="state">${r.connected ? "Connected" : "Disconnected"}</span></div>
+  <dl class="kv">${stats.map(([k, v]) => `<div><dt>${k}</dt><dd>${fmt(v)}</dd></div>`).join("")}</dl>
+  ${r.lastError ? `<p class="r-err">${esc(r.lastError)}</p>` : ""}
+</article>`;
+}
+
+const ACTIONS = {
+  login, logout, recompute,
+  copy: copyText,
+  refresh: btn => act(btn, "Refreshing...", "head", refreshTenant),
+  remove: removeTenant,
+  pin: btn => toggle(btn, "pinned", true),
+  unpin: btn => toggle(btn, "pinned", false),
+  block: btn => toggle(btn, "blocked", true),
+  unblock: btn => toggle(btn, "blocked", false),
+  harvest: btn => act(btn, "Refreshing...", "harvest", loadHarvest),
+};
+const FORMS = {
+  "add-form": addTenant,
+  "settings-form": saveSettings,
+  "pin-form": f => addToList(f, "pinned"),
+  "block-form": f => addToList(f, "blocked"),
+};
+document.addEventListener("click", e => {
+  const el = e.target.closest("[data-act]");
+  if (el) {
+    e.preventDefault();
+    const fn = ACTIONS[el.dataset.act];
+    if (fn) fn(el);
+    return;
+  }
+  const card = e.target.closest("[data-href]");
+  if (card && !e.target.closest("a, button, input, code") && !String(getSelection())) location.hash = card.dataset.href;
+});
+document.addEventListener("submit", e => {
+  e.preventDefault();
+  const fn = FORMS[e.target.id];
+  if (fn) fn(e.target);
+});
+document.addEventListener("input", e => {
+  if (e.target.id !== "member-filter") return;
+  S.filter = e.target.value.trim();
+  paintMembers();
+});
+document.addEventListener("error", e => {
+  const img = e.target;
+  if (!img || img.tagName !== "IMG") return;
+  const span = document.createElement("span");
+  span.className = img.className;
+  span.style.cssText = img.style.cssText;
+  img.replaceWith(span);
+}, true);
+addEventListener("hashchange", route);
+
+async function boot() {
+  const saved = stored();
+  if ((await waitNostr()) && saved) enter(saved);
+  else renderLogin();
+}
+boot();
+</script>
+</body>
+</html>

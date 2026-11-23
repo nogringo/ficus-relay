@@ -200,7 +200,8 @@ void RelayServer::runNegentropy(ThreadPool<MsgNegentropy>::Thread &thr) {
                 auto subId = msg->sub.subId;
                 std::optional<uint64_t> treeId;
 
-                env.foreach_NegentropyFilter(txn, [&](auto &f){
+                // Pre-built trees cover the whole DB, so a virtual relay must use the scoped query path
+                if (!msg->sub.scope) env.foreach_NegentropyFilter(txn, [&](auto &f){
                     if (f.filter() == msg->filterStr) {
                         treeId = f.primaryKeyId;
                         return false;

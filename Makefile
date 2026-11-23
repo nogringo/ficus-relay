@@ -1,5 +1,5 @@
 BIN  ?= strfry
-APPS ?= dbutils relay mesh
+APPS ?= dbutils relay mesh banyan
 OPT  ?= -O3 -g
 
 include golpe/rules.mk
@@ -36,3 +36,8 @@ test-subid: build/subid_tests
 
 build/subid_tests: test/tests/SubIdTests.cpp build/golpe.h
 	$(CXX) $(CXXFLAGS) $(INCS) $< -o $@
+
+build/BanyanAdminHtml.h: src/apps/banyan/admin.html
+	perl -e 'local $$/; my $$c = <STDIN>; print "#pragma once\n\nstatic const char *banyanAdminHtml = R\"BANYANHTML(" . $$c . ")BANYANHTML\";\n"' < $< > $@
+
+src/apps/banyan/BanyanHttp.o: build/BanyanAdminHtml.h

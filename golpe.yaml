@@ -101,6 +101,40 @@ tables:
       - name: filter
         type: string
 
+  ## Banyan: a person who owns a virtual relay at /<slug> and /<npub>
+  Tenant:
+    fields:
+      - name: pubkey
+        type: ubytes
+        index:
+          unique: true
+      - name: slug
+        type: string
+        index:
+          unique: true
+      - name: addedAt
+      - name: settings
+        type: string
+
+  ## Banyan: trust universe computed for a tenant (members as JSON)
+  TenantUniverse:
+    primaryKey: tenantId
+    fields:
+      - name: tenantId
+      - name: computedAt
+      - name: members
+        type: string
+
+  ## Banyan: harvester backfill progress per pubkey (unix times)
+  HarvestState:
+    fields:
+      - name: pubkey
+        type: ubytes
+        index:
+          unique: true
+      - name: authoredBackfilledAt
+      - name: inboxBackfilledAt
+
 tablesRaw:
   ## Raw nostr event JSON, possibly compressed
   ## keys are levIds

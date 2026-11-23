@@ -1,0 +1,75 @@
+config:
+  - name: banyan__enabled
+    desc: "Banyan mode: each person added by an admin gets a virtual relay at /<slug> and /<npub>, and WebSocket connections on / are refused"
+    default: true
+  - name: banyan__admins
+    desc: "Comma-separated admin pubkeys (npub or hex) allowed to use the admin API and the /admin page"
+    default: ""
+  - name: banyan__acceptGiftWrapsForOwner
+    desc: "Accept and serve kind 1059 gift wraps whose p-tag is the virtual relay's owner, even though their signer is outside the universe"
+    default: true
+
+  - name: banyan__trust__recomputeIntervalSeconds
+    desc: "How often each person's trust universe is recomputed"
+    default: 3600
+  - name: banyan__trust__windowDays
+    desc: "Only engagement newer than this is used to compute trust"
+    default: 365
+  - name: banyan__trust__halfLifeDays
+    desc: "Engagement weight halves every this many days (0 disables decay)"
+    default: 90
+  - name: banyan__trust__primaryCircleSize
+    desc: "Default maximum number of peers in the primary trust circle"
+    default: 50
+  - name: banyan__trust__secondaryPerPeer
+    desc: "Default number of peers taken from each primary peer to form the secondary circle"
+    default: 10
+  - name: banyan__trust__minScore
+    desc: "Default minimum mutual engagement score for a peer to enter a circle"
+    default: 2
+  - name: banyan__trust__weightReply
+    desc: "Default weight of a reply"
+    default: 3
+  - name: banyan__trust__weightRepost
+    desc: "Default weight of a repost"
+    default: 2
+  - name: banyan__trust__weightReaction
+    desc: "Default weight of a reaction"
+    default: 1
+  - name: banyan__trust__weightZap
+    desc: "Default weight of a zap"
+    default: 4
+  - name: banyan__trust__weightMention
+    desc: "Default weight of a mention or quote"
+    default: 1
+
+  - name: banyan__harvester__enabled
+    desc: "Fetch the universe's events from other relays"
+    default: true
+  - name: banyan__harvester__bootstrapRelays
+    desc: "Comma-separated relays used to find relay lists (kind 10002) and as a fallback for pubkeys without one"
+    default: "wss://purplepag.es, wss://relay.primal.net, wss://relay.ditto.pub"
+  - name: banyan__harvester__excludedRelays
+    desc: "Comma-separated relays the harvester never connects to"
+    default: ""
+  - name: banyan__harvester__maxRelays
+    desc: "Maximum number of relays the harvester stays connected to"
+    default: 40
+  - name: banyan__harvester__relaysPerPubkey
+    desc: "Number of relays from a pubkey's relay list used to fetch its events"
+    default: 2
+  - name: banyan__harvester__backfillDays
+    desc: "How far back the first backfill of a pubkey goes"
+    default: 365
+  - name: banyan__harvester__maxConcurrentReqsPerRelay
+    desc: "Maximum number of backfill REQs open at once on one relay"
+    default: 4
+  - name: banyan__harvester__authorsPerFilter
+    desc: "Maximum number of pubkeys in one harvester filter"
+    default: 100
+  - name: banyan__harvester__pageLimit
+    desc: "limit sent in backfill filters (pagination goes on until a page comes back empty)"
+    default: 500
+  - name: banyan__harvester__replanIntervalSeconds
+    desc: "How often the harvester recomputes which relays to use"
+    default: 60

@@ -5,6 +5,7 @@
 #include "Subscription.h"
 #include "filters.h"
 #include "events.h"
+#include "apps/banyan/Tenants.h"
 
 
 struct DBScan : NonCopyable {
@@ -91,6 +92,7 @@ struct DBScan : NonCopyable {
     };
 
     const NostrFilter &f;
+    const banyan::TenantView *scope;
     bool indexOnly;
     lmdb::dbi indexDbi;
     const char *desc = "?";
@@ -101,8 +103,21 @@ struct DBScan : NonCopyable {
     uint64_t nextInitIndex = 0;
     uint64_t approxWork = 0;
 
-    DBScan(const NostrFilter &f) : f(f) {
-        indexOnly = f.indexOnlyScans;
+    DBScan(const NostrFilter &f, const banyan::TenantView *scope = nullptr) : f(f), scope(scope) {
+        indexOnly = f.indexOnlyScans && !scope;
+
+        // A scoped filter on kinds alone would walk every tenant's events, so walk the universe's authors instead.
+        // Gift wraps are signed by random keys, so filters that may match them keep the regular scan.
+        std::vector<std::string> scopeAuthors;
+        if (scope && !f.ids && f.tags.empty() && !f.authors && f.kinds && scope->universe.size() * f.kinds->size() < 1'000) {
+            bool mayMatchGiftWraps = false;
+            for (uint64_t j = 0; j < f.kinds->size(); j++) {
+                if (f.kinds->at(j) == 1059 || f.kinds->at(j) == 21059) mayMatchGiftWraps = true;
+            }
+            if (!mayMatchGiftWraps) {
+                for (const auto &pk : scope->universe) scopeAuthors.push_back(pk.str());
+            }
+        }
 
         if (f.ids) {
             indexDbi = env.dbi_Event__id;
@@ -191,6 +206,25 @@ struct DBScan : NonCopyable {
                     }
                 );
             }
+        } else if (scopeAuthors.size()) {
+            indexDbi = env.dbi_Event__pubkeyKind;
+            desc = "ScopePubkeyKind";
+
+            cursors.reserve(scopeAuthors.size() * f.kinds->size());
+            for (const auto &author : scopeAuthors) {
+                for (uint64_t j = 0; j < f.kinds->size(); j++) {
+                    std::string search = author;
+                    search += lmdb::to_sv<uint64_t>(f.kinds->at(j));
+
+                    cursors.emplace_back(
+                        search + std::string(8, '\xFF'),
+                        MAX_U64,
+                        [search](std::string_view k){
+                            return k.starts_with(search) ? KeyMatchResult::Yes : KeyMatchResult::No;
+                        }
+                    );
+                }
+            }
         } else if (f.kinds) {
             indexDbi = env.dbi_Event__kind;
             desc = "Kind";
@@ -258,7 +292,10 @@ struct DBScan : NonCopyable {
             } else {
                 approxWork += 10;
                 auto view = env.lookup_Event(txn, levId);
-                if (view && f.doesMatch(PackedEventView(view->buf))) doSend = true;
+                if (view) {
+                    PackedEventView packed(view->buf);
+                    if (f.doesMatch(packed) && (!scope || scope->canSee(packed))) doSend = true;
+                }
             }
 
             if (doSend) {
@@ -303,7 +340,7 @@ struct DBQuery : NonCopyable {
         while (filterGroupIndex < sub.filterGroup.size()) {
             const auto &f = sub.filterGroup.filters[filterGroupIndex];
 
-            if (!scanner) scanner = std::make_unique<DBScan>(f);
+            if (!scanner) scanner = std::make_unique<DBScan>(f, sub.scope.get());
 
             uint64_t startTime = hoytech::curr_time_us();
 

@@ -25,6 +25,12 @@ node "./test/tests/readRestrictTest.js" \
   && pass "./test/tests/readRestrictTest.js" \
   || fail "./test/tests/readRestrictTest.js failed"
 
+info "running banyan tests..."
+
+node "./test/tests/banyanTest.js" \
+  && pass "./test/tests/banyanTest.js" \
+  || fail "./test/tests/banyanTest.js failed"
+
 info "Seeding events..."
 
 perl "./test/utils/generate-seed-data.pl" -o - | ./strfry --config ./test/cfgs/test.conf import --no-verify

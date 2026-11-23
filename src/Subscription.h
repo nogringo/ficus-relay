@@ -1,9 +1,14 @@
 #pragma once
 
+#include <memory>
+
 #include <parallel_hashmap/phmap_utils.h>
 
 #include "golpe.h"
 #include "filters.h"
+
+
+namespace banyan { struct TenantView; }
 
 
 struct SubId {
@@ -56,6 +61,10 @@ struct Subscription : NonCopyable {
     SubId subId;
     NostrFilterGroup filterGroup;
     bool countOnly;
+
+    // Banyan virtual relay this subscription is scoped to (0 and nullptr when unscoped)
+    uint64_t tenantId = 0;
+    std::shared_ptr<const banyan::TenantView> scope;
 
     // State
 

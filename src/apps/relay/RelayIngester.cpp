@@ -1,6 +1,15 @@
 #include "RelayServer.h"
 #include "jsonParseUtils.h"
 #include "ReadRestrictor.h"
+#include "apps/banyan/Tenants.h"
+
+
+static banyan::TenantPtr resolveTenant(uint64_t tenantId) {
+    if (tenantId == 0) return nullptr;
+    auto tenant = banyan::TenantRegistry::get()->findById(tenantId);
+    if (!tenant) throw herr("this virtual relay no longer exists");
+    return tenant;
+}
 
 
 void RelayServer::runIngester(ThreadPool<MsgIngester>::Thread &thr) {
@@ -31,7 +40,7 @@ void RelayServer::runIngester(ThreadPool<MsgIngester>::Thread &thr) {
                             if (cfg().relay__logging__dumpInEvents) LI << "[" << msg->connId << "] dumpInEvent: " << msg->payload; 
 
                             try {
-                                ingesterProcessEvent(txn, rsctx, msg->connId, msg->ipAddr, arr[1], writerMsgs);
+                                ingesterProcessEvent(txn, rsctx, msg->connId, msg->tenantId, msg->ipAddr, arr[1], writerMsgs);
                             } catch (std::exception &e) {
                                 sendOKResponse(msg->connId, arr[1].is_object() && arr[1].at("id").is_string() ? arr[1].at("id").get_string() : "?",
                                                false, std::string("invalid: ") + e.what());
@@ -42,7 +51,7 @@ void RelayServer::runIngester(ThreadPool<MsgIngester>::Thread &thr) {
                             if (cfg().relay__logging__dumpInAll) LI << "[" << msg->connId << "] dumpInAuth: " << msg->payload;
 
                             try {
-                                ingesterProcessAuth(rsctx, msg->connId, arr[1]);
+                                ingesterProcessAuth(rsctx, msg->connId, msg->tenantId, arr[1]);
                             } catch (std::exception &e) {
                                 PrometheusMetrics::getInstance().authFailureTotal.inc();
                                 sendOKResponse(msg->connId, arr[1].is_object() && arr[1].at("id").is_string() ? arr[1].at("id").get_string() : "?",
@@ -55,7 +64,7 @@ void RelayServer::runIngester(ThreadPool<MsgIngester>::Thread &thr) {
                             std::string subIdStr;
 
                             try {
-                                ingesterProcessReq(txn, rsctx, msg->connId, arr, cmd == "COUNT", subIdStr);
+                                ingesterProcessReq(txn, rsctx, msg->connId, msg->tenantId, arr, cmd == "COUNT", subIdStr);
                             } catch (std::exception &e) {
                                 if (subIdStr.size()) sendClosedError(msg->connId, subIdStr, std::string("bad req: ") + e.what());
                                 else sendNoticeError(msg->connId, std::string("bad req: ") + e.what());
@@ -74,7 +83,7 @@ void RelayServer::runIngester(ThreadPool<MsgIngester>::Thread &thr) {
                             if (!cfg().relay__negentropy__enabled) throw herr("negentropy disabled");
 
                             try {
-                                ingesterProcessNegentropy(txn, rsctx, msg->connId, arr);
+                                ingesterProcessNegentropy(txn, rsctx, msg->connId, msg->tenantId, arr);
                             } catch (std::exception &e) {
                                 sendNoticeError(msg->connId, std::string("negentropy error: ") + e.what());
                             }
@@ -108,13 +117,18 @@ void RelayServer::runIngester(ThreadPool<MsgIngester>::Thread &thr) {
     }
 }
 
-void RelayServer::ingesterProcessEvent(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, std::string ipAddr, const tao::json::value &origJson, std::vector<MsgWriter> &output) {
+void RelayServer::ingesterProcessEvent(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, uint64_t tenantId, std::string ipAddr, const tao::json::value &origJson, std::vector<MsgWriter> &output) {
     std::string packedStr, jsonStr;
 
     parseAndVerifyEvent(origJson, rsctx.secpCtx, true, true, packedStr, jsonStr);
 
     PackedEventView packed(packedStr);
     Bytes32 authedPubkey;
+
+    if (auto tenant = resolveTenant(tenantId); tenant && !tenant->canWrite(packed)) {
+        sendOKResponse(connId, to_hex(packed.id()), false, "blocked: author is not in this relay's trust universe");
+        return;
+    }
 
     {
         // discard reposts that embed protected events
@@ -201,9 +215,10 @@ void RelayServer::ingesterProcessEvent(lmdb::txn &txn, RelayServerCtx &rsctx, ui
     output.emplace_back(MsgWriter{MsgWriter::AddEvent{connId, std::move(ipAddr), std::move(packedStr), std::move(jsonStr), authedPubkey}});
 }
 
-void RelayServer::ingesterProcessReq(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, const tao::json::value &arr, bool countOnly, std::string &outSubIdStr) {
+void RelayServer::ingesterProcessReq(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, uint64_t tenantId, const tao::json::value &arr, bool countOnly, std::string &outSubIdStr) {
     if (arr.get_array().size() < 2 + 1) throw herr("arr too small");
     outSubIdStr = jsonGetString(arr[1], "subscription id was not a string");
+    auto tenant = resolveTenant(tenantId);
     if (arr.get_array().size() > 2 + cfg().relay__maxReqFilterSize) throw herr("arr too big");
 
     uint64_t maxFilterLimit;
@@ -259,6 +274,8 @@ void RelayServer::ingesterProcessReq(lmdb::txn &txn, RelayServerCtx &rsctx, uint
     }
 
     Subscription sub(connId, outSubIdStr, std::move(filterGroup), countOnly);
+    sub.tenantId = tenantId;
+    sub.scope = tenant;
 
     tpReqWorker.dispatch(connId, MsgReqWorker{MsgReqWorker::NewSub{std::move(sub)}});
 }
@@ -279,7 +296,7 @@ static std::string normalizeRelayUrl(std::string_view url) {
     return result;
 }
 
-void RelayServer::ingesterProcessAuth(RelayServerCtx &rsctx, uint64_t connId, const tao::json::value &eventJson) {
+void RelayServer::ingesterProcessAuth(RelayServerCtx &rsctx, uint64_t connId, uint64_t tenantId, const tao::json::value &eventJson) {
     if (cfg().relay__auth__serviceUrl.empty()) throw herr("relay needs serviceUrl to be configured before AUTH can work");
 
     std::string packedStr, jsonStr;
@@ -302,13 +319,23 @@ void RelayServer::ingesterProcessAuth(RelayServerCtx &rsctx, uint64_t connId, co
     bool foundCorrectRelayUrl = false;
 
     std::string normalizedServiceUrl = normalizeRelayUrl(cfg().relay__auth__serviceUrl);
+    auto tenant = resolveTenant(tenantId);
+
+    // A virtual relay's AUTH must name its own path, otherwise a signature for /alice would open /bob
+    auto relayTagMatches = [&](std::string_view value){
+        if (!tenant) return normalizeRelayUrl(value) == normalizedServiceUrl;
+        auto parts = banyan::parseRelayUrl(value);
+        if (parts.host != normalizedServiceUrl) return false;
+        auto target = banyan::TenantRegistry::get()->findByPath(parts.path);
+        return target && target->id == tenant->id;
+    };
 
     for (const auto &tagj : eventJson.at("tags").get_array()) {
         const auto &tag = tagj.get_array();
         if (tag.size() < 2) continue;
         const auto name = tag[0].as<std::string_view>();
         const auto value = tag[1].as<std::string_view>();
-        if (name == "relay" && normalizeRelayUrl(value) == normalizedServiceUrl) {
+        if (name == "relay" && relayTagMatches(value)) {
             foundCorrectRelayUrl = true;
         } else if (name == "challenge" && value == as.challengeSv()) {
             foundChallenge = true;
@@ -316,7 +343,11 @@ void RelayServer::ingesterProcessAuth(RelayServerCtx &rsctx, uint64_t connId, co
     }
 
     if (!foundChallenge) throw herr("challenge string mismatch");
-    if (!foundCorrectRelayUrl) throw herr("incorrect or missing relay tag, expected: " + cfg().relay__auth__serviceUrl);
+    if (!foundCorrectRelayUrl) {
+        std::string expected = cfg().relay__auth__serviceUrl;
+        if (tenant) expected += "/" + tenant->slug;
+        throw herr("incorrect or missing relay tag, expected: " + expected);
+    }
 
     // set the connection as authenticated with this pubkey
     as.markAuthed(packed.pubkey());
@@ -329,7 +360,7 @@ void RelayServer::ingesterProcessAuth(RelayServerCtx &rsctx, uint64_t connId, co
     sendOKResponse(connId, to_hex(packed.id()), true, "successfully authenticated");
 }
 
-void RelayServer::ingesterProcessNegentropy(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, const tao::json::value &arr) {
+void RelayServer::ingesterProcessNegentropy(lmdb::txn &txn, RelayServerCtx &rsctx, uint64_t connId, uint64_t tenantId, const tao::json::value &arr) {
     const auto &vals = arr.get_array();
 
     if (vals.size() < 2) throw herr("negentropy query missing elements");
@@ -374,6 +405,8 @@ void RelayServer::ingesterProcessNegentropy(lmdb::txn &txn, RelayServerCtx &rsct
         }
 
         Subscription sub(connId, subscriptionStr, std::move(filter));
+        sub.tenantId = tenantId;
+        sub.scope = resolveTenant(tenantId);
 
         filterJson.get_object().erase("since");
         filterJson.get_object().erase("until");

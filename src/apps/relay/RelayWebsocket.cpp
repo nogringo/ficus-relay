@@ -5,11 +5,12 @@
 #include "Favicon.h"
 #include "Bech32Utils.h"
 #include "PrometheusMetrics.h"
+#include "apps/banyan/BanyanHttp.h"
 
 
 
-static std::string preGenerateHttpResponse(const std::string &contentType, const std::string &content, const std::string &extraHeaders = "") {
-    std::string output = "HTTP/1.1 200 OK\r\n";
+static std::string generateHttpResponse(int status, const std::string &contentType, const std::string &content, const std::string &extraHeaders = "") {
+    std::string output = "HTTP/1.1 " + std::to_string(status) + " " + banyan::httpStatusText(status) + "\r\n";
     output += std::string("Content-Type: ") + contentType + "\r\n";
     output += "Access-Control-Allow-Origin: *\r\n";
     output += "Connection: keep-alive\r\n";
@@ -21,6 +22,10 @@ static std::string preGenerateHttpResponse(const std::string &contentType, const
     return output;
 };
 
+static std::string preGenerateHttpResponse(const std::string &contentType, const std::string &content, const std::string &extraHeaders = "") {
+    return generateHttpResponse(200, contentType, content, extraHeaders);
+}
+
 
 
 void RelayServer::runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr) {
@@ -29,6 +34,8 @@ void RelayServer::runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr) {
         uint64_t connId;
         uint64_t connectedTimestamp;
         std::string ipAddr;
+        uint64_t tenantId = 0;
+        bool rejected = false;
         struct Stats {
             uint64_t bytesUp = 0;
             uint64_t bytesUpCompressed = 0;
@@ -79,39 +86,43 @@ void RelayServer::runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr) {
         return output;
     };
 
-    auto getServerInfoHttpResponse = [&supportedNips, ver = uint64_t(0), rendered = std::string("")]() mutable {
+    auto buildNip11 = [&supportedNips]() {
+        auto maybeNpub = [](std::string_view sv){
+            if (sv.starts_with("npub1")) {
+                return to_hex(decodeBech32Simple(sv));
+            } else {
+                return std::string(sv);
+            }
+        };
+
+        tao::json::value nip11 = tao::json::value({
+            { "supported_nips", supportedNips() },
+            { "software", "git+https://github.com/hoytech/strfry.git" },
+            { "version", APP_GIT_VERSION },
+            { "negentropy", negentropy::PROTOCOL_VERSION - 0x60 },
+            { "limitation", tao::json::value({
+                { "max_message_length", cfg().relay__maxWebsocketPayloadSize },
+                { "max_subscriptions", cfg().relay__maxSubsPerConnection },
+                { "max_limit", cfg().relay__maxFilterLimit },
+            }) },
+        });
+
+        if (cfg().relay__info__name.size()) nip11["name"] = cfg().relay__info__name;
+        if (cfg().relay__info__description.size()) nip11["description"] = cfg().relay__info__description;
+        if (cfg().relay__info__contact.size()) nip11["contact"] = cfg().relay__info__contact;
+        if (cfg().relay__info__pubkey.size()) nip11["pubkey"] = maybeNpub(cfg().relay__info__pubkey);
+        if (cfg().relay__info__icon.size()) nip11["icon"] = cfg().relay__info__icon;
+        if (cfg().relay__info__banner.size()) nip11["banner"] = cfg().relay__info__banner;
+        if (cfg().relay__info__self.size()) nip11["self"] = maybeNpub(cfg().relay__info__self);
+        if (cfg().relay__info__privacy.size()) nip11["privacy_policy"] = cfg().relay__info__privacy;
+        if (cfg().relay__info__terms.size()) nip11["terms_of_service"] = cfg().relay__info__terms;
+
+        return nip11;
+    };
+
+    auto getServerInfoHttpResponse = [&buildNip11, ver = uint64_t(0), rendered = std::string("")]() mutable {
         if (ver != cfg().version()) {
-            auto maybeNpub = [](std::string_view sv){
-                if (sv.starts_with("npub1")) {
-                    return to_hex(decodeBech32Simple(sv));
-                } else {
-                    return std::string(sv);
-                }
-            };
-
-            tao::json::value nip11 = tao::json::value({
-                { "supported_nips", supportedNips() },
-                { "software", "git+https://github.com/hoytech/strfry.git" },
-                { "version", APP_GIT_VERSION },
-                { "negentropy", negentropy::PROTOCOL_VERSION - 0x60 },
-                { "limitation", tao::json::value({
-                    { "max_message_length", cfg().relay__maxWebsocketPayloadSize },
-                    { "max_subscriptions", cfg().relay__maxSubsPerConnection },
-                    { "max_limit", cfg().relay__maxFilterLimit },
-                }) },
-            });
-
-            if (cfg().relay__info__name.size()) nip11["name"] = cfg().relay__info__name;
-            if (cfg().relay__info__description.size()) nip11["description"] = cfg().relay__info__description;
-            if (cfg().relay__info__contact.size()) nip11["contact"] = cfg().relay__info__contact;
-            if (cfg().relay__info__pubkey.size()) nip11["pubkey"] = maybeNpub(cfg().relay__info__pubkey);
-            if (cfg().relay__info__icon.size()) nip11["icon"] = cfg().relay__info__icon;
-            if (cfg().relay__info__banner.size()) nip11["banner"] = cfg().relay__info__banner;
-            if (cfg().relay__info__self.size()) nip11["self"] = maybeNpub(cfg().relay__info__self);
-            if (cfg().relay__info__privacy.size()) nip11["privacy_policy"] = cfg().relay__info__privacy;
-            if (cfg().relay__info__terms.size()) nip11["terms_of_service"] = cfg().relay__info__terms;
-
-            rendered = preGenerateHttpResponse("application/json", tao::json::to_string(nip11));
+            rendered = preGenerateHttpResponse("application/json", tao::json::to_string(buildNip11()));
             ver = cfg().version();
         }
 
@@ -227,11 +238,90 @@ void RelayServer::runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr) {
 
     if (cfg().relay__autoPingSeconds) hubGroup->startAutoPing(cfg().relay__autoPingSeconds * 1'000);
 
+    auto writeReply = [](uWS::HttpResponse *res, const banyan::HttpReply &reply){
+        auto response = generateHttpResponse(reply.status, reply.contentType, reply.body);
+        res->write(response.data(), response.size());
+    };
+
+    auto getTenantInfoHttpResponse = [&buildNip11](const banyan::TenantView &tenant){
+        auto nip11 = buildNip11();
+        nip11["name"] = tenant.slug + " (Banyan)";
+        nip11["description"] = "Banyan relay of " + tenant.npub + ": notes from their trust universe (" + std::to_string(tenant.universe.size()) + " people).";
+        nip11["pubkey"] = to_hex(tenant.pubkey.sv());
+        nip11["limitation"]["restricted_writes"] = true;
+        return preGenerateHttpResponse("application/json", tao::json::to_string(nip11));
+    };
+
+    struct PendingPost {
+        banyan::HttpRequestInfo info;
+        bool tooLarge = false;
+    };
+
+    flat_hash_map<uWS::HttpResponse*, PendingPost> pendingPosts;
+    const size_t maxPostBodySize = 65536;
+
+    auto finishPost = [&](uWS::HttpResponse *res, const PendingPost &p){
+        if (p.tooLarge) writeReply(res, { 413, "application/json", R"({"error":"request too large"})" });
+        else if (p.info.path.empty()) writeReply(res, banyan::handleAdminRpc(p.info));
+        else writeReply(res, { 404, "application/json", R"({"error":"not found"})" });
+    };
+
+    auto isStrfryRoute = [](const std::string &url){
+        return url == "/metrics" || url == "/.well-known/nodeinfo" || url == "/nodeinfo/2.1" || url == "/favicon.ico";
+    };
+
     hubGroup->onHttpRequest([&](uWS::HttpResponse *res, uWS::HttpRequest req, char *data, size_t length, size_t remainingBytes){
         LI << "HTTP request for [" << req.getUrl().toString() << "]";
 
         std::string host = req.getHeader("host").toString();
         std::string url = req.getUrl().toString();
+
+        if (cfg().banyan__enabled) {
+            auto method = req.getMethod();
+            std::string path = banyan::normalizePath(url);
+
+            if (method == uWS::HttpMethod::METHOD_OPTIONS) {
+                auto response = generateHttpResponse(204, "text/plain", "",
+                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, Accept\r\n");
+                res->write(response.data(), response.size());
+                return;
+            }
+
+            if (method == uWS::HttpMethod::METHOD_POST) {
+                PendingPost p;
+                p.info.method = "POST";
+                p.info.path = path;
+                p.info.host = host;
+                p.info.accept = req.getHeader("accept").toString();
+                p.info.authorization = req.getHeader("authorization").toString();
+                if (length + remainingBytes > maxPostBodySize) p.tooLarge = true;
+                else if (length) p.info.body.assign(data, length);
+
+                if (remainingBytes == 0) finishPost(res, p);
+                else pendingPosts[res] = std::move(p);
+                return;
+            }
+
+            if (path == "admin") {
+                writeReply(res, { 200, "text/html; charset=utf-8", std::string(banyan::adminPageHtml()) });
+                return;
+            }
+
+            if (path.size() && !isStrfryRoute(url)) {
+                auto tenant = banyan::TenantRegistry::get()->findByPath(path);
+
+                if (!tenant) {
+                    writeReply(res, { 404, "text/plain", "unknown relay\n" });
+                } else if (req.getHeader("accept").toStringView() == "application/nostr+json") {
+                    auto info = getTenantInfoHttpResponse(*tenant);
+                    res->write(info.data(), info.size());
+                } else {
+                    writeReply(res, banyan::tenantLandingPage(*tenant, host));
+                }
+
+                return;
+            }
+        }
 
         if (url == "/metrics") {
             auto metrics = PrometheusMetrics::getInstance().render();
@@ -254,10 +344,43 @@ void RelayServer::runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr) {
         }
     });
 
+    hubGroup->onHttpData([&](uWS::HttpResponse *res, char *data, size_t length, size_t remainingBytes){
+        auto it = pendingPosts.find(res);
+        if (it == pendingPosts.end()) return;
+
+        auto &p = it->second;
+        if (!p.tooLarge) p.info.body.append(data, length);
+
+        if (remainingBytes == 0) {
+            auto finished = std::move(p);
+            pendingPosts.erase(it);
+            finishPost(res, finished);
+        }
+    });
+
+    hubGroup->onCancelledHttpRequest([&](uWS::HttpResponse *res){
+        pendingPosts.erase(res);
+    });
+
     hubGroup->onConnection([&](uWS::WebSocket<uWS::SERVER> *ws, uWS::HttpRequest req) {
         uint64_t connId = nextConnectionId++;
 
         Connection *c = new Connection(ws, connId);
+        std::string rejectReason;
+
+        if (cfg().banyan__enabled) {
+            std::string path = banyan::normalizePath(req.getUrl().toString());
+
+            if (path.empty()) {
+                rejectReason = "this is a Banyan relay, connect to a person's relay at /<name>";
+            } else if (auto tenant = banyan::TenantRegistry::get()->findByPath(path)) {
+                c->tenantId = tenant->id;
+            } else {
+                rejectReason = "unknown relay: /" + path;
+            }
+
+            c->rejected = rejectReason.size() > 0;
+        }
 
         if (cfg().relay__realIpHeader.size()) {
             auto header = req.getHeader(cfg().relay__realIpHeader.c_str()).toString(); // not string_view: parseIP needs trailing 0 byte
@@ -285,6 +408,13 @@ void RelayServer::runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr) {
             if (setsockopt(ws->getFd(), SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval))) {
                 LW << "Failed to enable TCP keepalive: " << strerror(errno);
             }
+        }
+
+        // Last, because closing may run onDisconnection, which deletes c
+        if (rejectReason.size()) {
+            auto notice = tao::json::to_string(tao::json::value::array({ "NOTICE", "error: " + rejectReason }));
+            ws->send(notice.data(), notice.size(), uWS::OpCode::TEXT);
+            ws->close(1008);
         }
     });
 
@@ -324,7 +454,9 @@ void RelayServer::runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr) {
         c.stats.bytesDown += length;
         c.stats.bytesDownCompressed += compressedSize;
 
-        tpIngester.dispatch(c.connId, MsgIngester{MsgIngester::ClientMessage{c.connId, c.ipAddr, std::string(message, length)}});
+        if (c.rejected) return;
+
+        tpIngester.dispatch(c.connId, MsgIngester{MsgIngester::ClientMessage{c.connId, c.ipAddr, std::string(message, length), c.tenantId}});
     });
 
 
