@@ -24,7 +24,12 @@ Reads (`REQ`, `COUNT`, `NEG-OPEN` and live events) only return events whose auth
 
 Gift wraps (`kind:1059`) are signed by random keys, so they are also served and accepted when their `p` tag is the owner (`banyan.acceptGiftWrapsForOwner`).
 
-Writes (`EVENT`) are accepted only when they would be visible: authored by a universe member, or a gift wrap for the owner. Everything else gets `OK false` with `blocked: author is not in this relay's trust universe`.
+Writes (`EVENT`) are accepted when they would be visible: authored by a universe member, or a gift wrap for the owner. Two other kinds of events are accepted and stored, but not served:
+
+* engagement the trust machine reads (see the table below) that mentions the owner, a pinned person or a primary member, within `banyan.trust.windowDays` (`banyan.acceptIncomingEngagement`). Without it, someone whose Banyan is their only inbox would never get a newcomer's replies, and the newcomer could never enter a circle;
+* a `kind:5` deleting an event its signer has stored here, since that engagement, and what the harvester fetches, can come from people outside the universe.
+
+Everything else gets `OK false` with `blocked: author is not in this relay's trust universe`.
 
 NIP-42 AUTH checks the path: the `relay` tag must name this virtual relay (`wss://relay.example.com/alice` or its npub form), so a signature for one virtual relay never opens another.
 
@@ -108,7 +113,8 @@ Events stay in the database when no virtual relay serves them, because the trust
 
 * everything authored by someone in a universe, and by the people blocked or hidden behind a blocked member, so unblocking stays immediate;
 * gift wraps for an owner;
-* engagement the trust machine reads: events of an engagement kind, within `banyan.trust.windowDays`, that mention (`p`) the owner, a pinned person or a primary member of some universe, blocked ones included, and zap receipts that name one of them as sender (`P`).
+* engagement the trust machine reads: events of an engagement kind, within `banyan.trust.windowDays`, that mention (`p`) the owner, a pinned person or a primary member of some universe, blocked ones included, and zap receipts that name one of them as sender (`P`);
+* deletions (`kind:5`) within `banyan.trust.windowDays`, so the harvester can't store a deleted event again.
 
 So what goes is the history of people who left every universe, and what strangers published without mentioning a seed. When someone's history is pruned, their harvester progress is reset, so if they come back into a universe their history is fetched again.
 
@@ -172,7 +178,7 @@ A running relay picks up CLI changes within 5 seconds.
 
 ## Tests
 
-`test/tests/banyanTest.js` covers path routing, scoped reads, writes and live events, gift wraps, AUTH bound to the path, per-relay NIP-11, the admin API with NIP-98, owners managing their own relay, the trust circles on a small engagement graph (including forged and duplicated zap receipts, one-sided floods and blocked members freeing their slot), thread filters (stored, live, out of order, through an article's address), and pruning. A last phase restarts the relay with the harvester pointed at a fake upstream relay that refuses everything before NIP-42 AUTH, and checks that the harvester authenticates, fetches, and delivers a reply to the inbox of the person it mentions. It needs [nak](https://github.com/fiatjaf/nak) on `PATH` to generate keys and sign events, and runs as part of `test/runTests.sh`. The other test suites run with `banyan.enabled = false`. The relay's logs are left in `strfry-banyan-tests/relay.log` under the system temp directory.
+`test/tests/banyanTest.js` covers path routing, scoped reads, writes and live events, engagement and deletions accepted from outside the universe, gift wraps, AUTH bound to the path, per-relay NIP-11, the admin API with NIP-98, owners managing their own relay, the trust circles on a small engagement graph (including forged and duplicated zap receipts, one-sided floods and blocked members freeing their slot), thread filters (stored, live, out of order, through an article's address), and pruning. A last phase restarts the relay with the harvester pointed at a fake upstream relay that refuses everything before NIP-42 AUTH, and checks that the harvester authenticates, fetches, and delivers a reply to the inbox of the person it mentions. It needs [nak](https://github.com/fiatjaf/nak) on `PATH` to generate keys and sign events, and runs as part of `test/runTests.sh`. The other test suites run with `banyan.enabled = false`. The relay's logs are left in `strfry-banyan-tests/relay.log` under the system temp directory.
 
 ## Not done yet
 

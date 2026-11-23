@@ -31,6 +31,40 @@ bool isEngagementKind(uint64_t kind) {
     return kind == 9735 || std::find(engagementKinds.begin(), engagementKinds.end(), kind) != engagementKinds.end();
 }
 
+uint64_t trustWindowStart(uint64_t now) {
+    uint64_t window = cfg().banyan__trust__windowDays * 86400;
+    return now > window ? now - window : 0;
+}
+
+// P tags are stored as hex, unlike p tags
+static std::optional<Bytes32> hexPubkey(std::string_view hex) {
+    if (hex.size() != 64) return std::nullopt;
+
+    try {
+        return Bytes32(from_hex(hex, false));
+    } catch (std::exception &) {
+        return std::nullopt;
+    }
+}
+
+bool isEngagementWith(const PackedEventView &ev, const flat_hash_set<Bytes32> &seeds, uint64_t trustSince) {
+    if (!isEngagementKind(ev.kind()) || ev.created_at() < trustSince) return false;
+
+    bool found = false;
+
+    ev.foreachTag([&](char tagName, std::string_view tagVal){
+        if (tagName == 'p' && tagVal.size() == 32) {
+            found = seeds.contains(Bytes32(tagVal));
+        } else if (tagName == 'P' && ev.kind() == 9735) {
+            auto sender = hexPubkey(tagVal);
+            found = sender && seeds.contains(*sender);
+        }
+        return !found;
+    });
+
+    return found;
+}
+
 
 static bool hasTag(const PackedEventView &ev, char name) {
     bool found = false;
@@ -148,8 +182,7 @@ static tao::json::value uintArray(const std::vector<uint64_t> &v) {
 
 
 std::vector<PeerEngagement> computeEngagement(const Bytes32 &seed, uint64_t now) {
-    uint64_t window = cfg().banyan__trust__windowDays * 86400;
-    uint64_t since = now > window ? now - window : 0;
+    uint64_t since = trustWindowStart(now);
     double halfLife = (double)cfg().banyan__trust__halfLifeDays * 86400;
 
     auto decay = [&](uint64_t created){

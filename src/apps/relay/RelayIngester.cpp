@@ -125,7 +125,7 @@ void RelayServer::ingesterProcessEvent(lmdb::txn &txn, RelayServerCtx &rsctx, ui
     PackedEventView packed(packedStr);
     Bytes32 authedPubkey;
 
-    if (auto tenant = resolveTenant(tenantId); tenant && !tenant->canWrite(packed)) {
+    if (auto tenant = resolveTenant(tenantId); tenant && !tenant->canWrite(txn, packed)) {
         sendOKResponse(connId, to_hex(packed.id()), false, "blocked: author is not in this relay's trust universe");
         return;
     }

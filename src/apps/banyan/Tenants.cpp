@@ -1,9 +1,12 @@
 #include <mutex>
 
 #include <hoytech/hex.h>
+#include <hoytech/time.h>
 
 #include "Tenants.h"
+#include "TrustEngine.h"
 #include "Bech32Utils.h"
+#include "events.h"
 
 
 namespace banyan {
@@ -208,6 +211,45 @@ bool TenantView::isGiftWrapForOwner(const PackedEventView &ev) const {
     });
 
     return found;
+}
+
+// NIP-09: people outside the universe can still have events stored here, harvested or accepted as engagement
+static bool deletesStoredEvent(lmdb::txn &txn, const PackedEventView &deletion) {
+    if (deletion.kind() != 5) return false;
+
+    bool found = false;
+
+    deletion.foreachTag([&](char tagName, std::string_view tagVal){
+        if (tagName == 'e') {
+            auto target = lookupEventById(txn, tagVal);
+            found = target && PackedEventView(target->buf).pubkey() == deletion.pubkey();
+        } else if (tagName == 'a') {
+            try {
+                auto [kind, pubkey, dTag] = parseATag(tagVal);
+
+                if (isParamReplaceableKind(kind) && pubkey == deletion.pubkey()) {
+                    auto searchKey = makeKey_StringUint64(pubkey + dTag, kind);
+
+                    env.generic_foreachFull(txn, env.dbi_Event__replace, searchKey, lmdb::to_sv<uint64_t>(MAX_U64), [&](auto k, auto){
+                        found = k == searchKey;
+                        return false;
+                    }, true);
+                }
+            } catch (std::exception &) {
+            }
+        }
+        return !found;
+    });
+
+    return found;
+}
+
+bool TenantView::canWrite(lmdb::txn &txn, const PackedEventView &ev) const {
+    if (canSee(ev)) return true;
+
+    if (cfg().banyan__acceptIncomingEngagement && isEngagementWith(ev, trustSeeds, trustWindowStart(hoytech::curr_time_s()))) return true;
+
+    return deletesStoredEvent(txn, ev);
 }
 
 size_t TenantView::countCircle(Circle c) const {

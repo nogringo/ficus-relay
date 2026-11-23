@@ -90,9 +90,8 @@ struct TenantView {
         return inUniverse(ev.pubkey()) || isGiftWrapForOwner(ev);
     }
 
-    bool canWrite(const PackedEventView &ev) const {
-        return canSee(ev);
-    }
+    // Also accepts, without serving them, what the trust engine needs from people outside the universe
+    bool canWrite(lmdb::txn &txn, const PackedEventView &ev) const;
 
     // The owner, pinned and primary members are seeds: the harvester also fetches the
     // events that mention them, because that is where incoming engagement comes from.

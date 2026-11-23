@@ -1,7 +1,6 @@
 #include <thread>
 
 #include <hoytech/time.h>
-#include <hoytech/hex.h>
 
 #include "Pruner.h"
 #include "Tenants.h"
@@ -19,38 +18,37 @@ struct KeepRules {
     flat_hash_set<Bytes32> authors;
     flat_hash_set<Bytes32> giftWrapRecipients;
     flat_hash_set<Bytes32> seeds;
-    flat_hash_set<std::string> seedsHex; // P tags are stored as hex, p tags as bytes
     uint64_t trustSince = 0;
 
     KeepRules(const TenantSnapshot &snap, uint64_t now) {
-        uint64_t window = cfg().banyan__trust__windowDays * 86400;
-        trustSince = now > window ? now - window : 0;
+        trustSince = trustWindowStart(now);
 
         for (const auto &t : snap.tenants) {
             authors.insert(t->retained.begin(), t->retained.end());
             seeds.insert(t->trustSeeds.begin(), t->trustSeeds.end());
             if (cfg().banyan__acceptGiftWrapsForOwner) giftWrapRecipients.insert(t->pubkey);
         }
-
-        for (const auto &pk : seeds) seedsHex.insert(to_hex(pk.sv()));
     }
 
-    // For events whose author is in no universe: gift wraps for an owner, and engagement the trust engine reads
+    // For events whose author is in no universe: deletions, gift wraps for an owner, and engagement the trust engine reads
     bool keepOther(const PackedEventView &ev) const {
         uint64_t kind = ev.kind();
-        bool giftWrap = kind == 1059 || kind == 21059;
-        bool evidence = isEngagementKind(kind) && ev.created_at() >= trustSince;
-        if (!giftWrap && !evidence) return false;
 
-        bool found = false;
+        // The deletion record is what stops the harvester from storing the deleted event again
+        if (kind == 5) return ev.created_at() >= trustSince;
 
-        ev.foreachTag([&](char tagName, std::string_view tagVal){
-            if (tagName == 'p' && tagVal.size() == 32) found = (giftWrap ? giftWrapRecipients : seeds).contains(Bytes32(tagVal));
-            else if (tagName == 'P' && kind == 9735) found = seedsHex.contains(std::string(tagVal));
-            return !found;
-        });
+        if (kind == 1059 || kind == 21059) {
+            bool found = false;
 
-        return found;
+            ev.foreachTag([&](char tagName, std::string_view tagVal){
+                if (tagName == 'p' && tagVal.size() == 32) found = giftWrapRecipients.contains(Bytes32(tagVal));
+                return !found;
+            });
+
+            return found;
+        }
+
+        return isEngagementWith(ev, seeds, trustSince);
     }
 };
 

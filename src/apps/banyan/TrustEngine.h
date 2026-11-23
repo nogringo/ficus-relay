@@ -23,6 +23,13 @@ struct PeerEngagement {
 // Kinds read as engagement, zap receipts included
 bool isEngagementKind(uint64_t kind);
 
+// Oldest created_at the trust engine reads (banyan.trust.windowDays)
+uint64_t trustWindowStart(uint64_t now);
+
+// What the trust engine reads about these seeds, whoever the author: engagement since trustSince
+// that p-tags one of them, or a zap receipt one of them sent (P)
+bool isEngagementWith(const PackedEventView &ev, const flat_hash_set<Bytes32> &seeds, uint64_t trustSince);
+
 // Only peers with engagement in both directions, since the others always score zero
 std::vector<PeerEngagement> computeEngagement(const Bytes32 &seed, uint64_t now);
 

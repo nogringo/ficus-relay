@@ -1,4 +1,4 @@
-// Banyan virtual relays: path routing, universe scoping, trust circles, admin API, thread filters,
+// Banyan virtual relays: path routing, universe scoping, incoming engagement, trust circles, admin API, thread filters,
 // owner self-management, pruning, and the harvester's NIP-42 AUTH and inbox delivery against a fake upstream relay.
 // Needs `nak` (https://github.com/fiatjaf/nak) on PATH to generate keys and sign events.
 
@@ -161,6 +161,8 @@ const forger = makeKey(); // forges receipts saying alice zapped them, and react
 const flooder = makeKey(); // alice answered once, then floods alice with reactions
 const lnurl = makeKey(); // signs zap receipts, like an LNURL server
 const outsider = makeKey(); // in no universe and mentions no seed: pruned
+const newcomer = makeKey(); // only reaches alice through her Banyan; alice answers, so they enter her circle
+const passerby = makeKey(); // replies to alice on her Banyan, then deletes it
 
 // Seeded events by name, for the thread and pruning tests
 const T = {};
@@ -411,6 +413,56 @@ async function testScopedWritesAndLive() {
   pass("testScopedWritesAndLive");
 }
 
+// If alice's Banyan is her only inbox, replies from people she doesn't know yet only ever reach it
+async function testIncomingEngagement() {
+  const a = await connect("alice");
+  await a.req("mentions", { "#p": [alice.pub], since: now() - 5 });
+
+  const post = sign(alice, { content: "who wants to talk?", created_at: now() });
+  expect((await a.publish(post))[2] === true, "alice posts");
+
+  const replies = [];
+  for (let i = 0; i < 3; i++) {
+    const r = sign(newcomer, { content: `newcomer answers ${i}`, tags: [["e", post.id], ["p", alice.pub]], created_at: now() });
+    const ok = await a.publish(r);
+    expect(ok[2] === true, `engagement with a seed is accepted from outside the universe: ${ok[3]}`);
+    replies.push(r);
+  }
+
+  const unrelated = await a.publish(sign(newcomer, { content: "newcomer note", created_at: now() }));
+  expect(unrelated[2] === false && String(unrelated[3]).startsWith("blocked:"), "an outsider's event that mentions no seed is still refused");
+
+  const stale = await a.publish(sign(newcomer, { content: "too old to count", tags: [["e", post.id], ["p", alice.pub]], created_at: now() - 400 * 86400 }));
+  expect(stale[2] === false, "engagement older than the trust window is refused");
+
+  const passing = sign(passerby, { content: "just passing", tags: [["e", post.id], ["p", alice.pub]], created_at: now() });
+  expect((await a.publish(passing))[2] === true, "the passerby's reply is accepted");
+  T.passerbyDeletion = sign(passerby, { kind: 5, tags: [["e", passing.id]], created_at: now() });
+  const deleted = await a.publish(T.passerbyDeletion);
+  expect(deleted[2] === true, `an outsider can delete what they have stored here: ${deleted[3]}`);
+  expect(scanIds({ ids: [passing.id] }).size === 0, "the deletion is applied");
+  const notTheirs = await a.publish(sign(passerby, { kind: 5, tags: [["e", post.id]], created_at: now() }));
+  expect(notTheirs[2] === false, "an outsider's deletion of someone else's event is refused");
+
+  expect((await a.req("hidden", { ids: replies.map((e) => e.id) })).length === 0, "accepted engagement is not served");
+  expect(scanIds({ ids: replies.map((e) => e.id) }).size === 3, "but it is stored for the trust engine");
+  let leaked = false;
+  a.waitFor((m) => m[0] === "EVENT" && m[1] === "mentions", 1000).then(() => (leaked = true), () => {});
+  await delay(1200);
+  expect(!leaked, "nor sent live");
+
+  for (let i = 0; i < 2; i++) {
+    const r = sign(alice, { content: `alice answers newcomer ${i}`, tags: [["e", replies[i].id], ["p", newcomer.pub]], created_at: now() });
+    expect((await a.publish(r))[2] === true, "alice answers");
+  }
+
+  const { out, scores } = recompute("alice");
+  expect(scores.get(newcomer.npub)?.circle === "primary", `replies sent only to alice's Banyan count toward trust, got:\n${out}`);
+  await until("the newcomer's replies to be served", async () => (await a.req(`v${Date.now()}`, { ids: replies.map((e) => e.id) })).length === 3);
+  a.close();
+  pass("testIncomingEngagement");
+}
+
 async function testAuthIsBoundToPath() {
   const c = await connect("alice");
   c.send(["REQ", "dm", { kinds: [4] }]);
@@ -606,6 +658,7 @@ async function testPrune() {
   expect(left.size === 1 && left.has(T.outsiderReply.id), "only trust evidence is left of an outsider");
   expect(scanIds({ ids: [T.strangerNote.id] }).size === 0, "a stranger's note that mentions no seed goes");
   expect(scanIds({ ids: [T.stranger.id, T.root.id, T.comment.id] }).size === 3, "universe events and mentions of seeds stay");
+  expect(scanIds({ ids: [T.passerbyDeletion.id] }).size === 1, "an outsider's deletion stays, so the harvester can't store its target again");
 
   const c = await connect("alice");
   expect((await c.req("after", { thread: [T.root.id] })).length >= 4, "the relay serves the same thread after pruning");
@@ -733,6 +786,7 @@ async function main() {
     await testRootAndUnknownPathsRefused();
     await testScopedReads();
     await testScopedWritesAndLive();
+    await testIncomingEngagement();
     await testAuthIsBoundToPath();
     await testHttp();
     await testAdminApi();
