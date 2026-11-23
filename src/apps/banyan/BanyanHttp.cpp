@@ -1,3 +1,5 @@
+#include <ctime>
+
 #include <secp256k1_schnorrsig.h>
 #include <hoytech/time.h>
 #include <hoytech/hex.h>
