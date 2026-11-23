@@ -249,7 +249,7 @@ static TenantPtr lookupTenant(const std::string &slugOrPubkey) {
 
 static bool patchAffectsTrust(const tao::json::value &patch) {
     for (const auto &[k, v] : patch.get_object()) {
-        if (k != "slug" && k != "blocked") return true;
+        if (k != "slug") return true;
     }
     return false;
 }

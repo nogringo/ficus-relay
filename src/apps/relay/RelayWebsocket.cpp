@@ -260,10 +260,19 @@ void RelayServer::runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr) {
     flat_hash_map<uWS::HttpResponse*, PendingPost> pendingPosts;
     const size_t maxPostBodySize = 65536;
 
-    auto finishPost = [&](uWS::HttpResponse *res, const PendingPost &p){
-        if (p.tooLarge) writeReply(res, { 413, "application/json", R"({"error":"request too large"})" });
-        else if (p.info.path.empty()) writeReply(res, banyan::handleAdminRpc(p.info));
-        else writeReply(res, { 404, "application/json", R"({"error":"not found"})" });
+    flat_hash_map<uint64_t, uWS::HttpResponse*> pendingAdminRpcs;
+    uint64_t nextAdminRpcId = 1;
+
+    auto finishPost = [&](uWS::HttpResponse *res, PendingPost &&p){
+        if (p.tooLarge) {
+            writeReply(res, { 413, "application/json", R"({"error":"request too large"})" });
+        } else if (p.info.path.empty()) {
+            uint64_t requestId = nextAdminRpcId++;
+            pendingAdminRpcs[requestId] = res;
+            tpBanyanAdmin.dispatch(0, MsgBanyanAdmin{MsgBanyanAdmin::Rpc{requestId, std::move(p.info)}});
+        } else {
+            writeReply(res, { 404, "application/json", R"({"error":"not found"})" });
+        }
     };
 
     auto isStrfryRoute = [](const std::string &url){
@@ -297,7 +306,7 @@ void RelayServer::runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr) {
                 if (length + remainingBytes > maxPostBodySize) p.tooLarge = true;
                 else if (length) p.info.body.assign(data, length);
 
-                if (remainingBytes == 0) finishPost(res, p);
+                if (remainingBytes == 0) finishPost(res, std::move(p));
                 else pendingPosts[res] = std::move(p);
                 return;
             }
@@ -354,12 +363,17 @@ void RelayServer::runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr) {
         if (remainingBytes == 0) {
             auto finished = std::move(p);
             pendingPosts.erase(it);
-            finishPost(res, finished);
+            finishPost(res, std::move(finished));
         }
     });
 
     hubGroup->onCancelledHttpRequest([&](uWS::HttpResponse *res){
         pendingPosts.erase(res);
+
+        for (auto it = pendingAdminRpcs.begin(); it != pendingAdminRpcs.end(); ) {
+            if (it->second == res) pendingAdminRpcs.erase(it++);
+            else ++it;
+        }
     });
 
     hubGroup->onConnection([&](uWS::WebSocket<uWS::SERVER> *ws, uWS::HttpRequest req) {
@@ -535,6 +549,11 @@ void RelayServer::runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr) {
                     memcpy(p, "[\"EVENT\",\"", 10);
                     memcpy(p + 10, subIdSv.data(), subIdSv.size());
                     doSend(item.connId, std::string_view(p, 13 + subIdSv.size() + msg->evJson.size()), uWS::OpCode::TEXT);
+                }
+            } else if (auto msg = std::get_if<MsgWebsocket::BanyanAdminReply>(&newMsg.msg)) {
+                if (auto it = pendingAdminRpcs.find(msg->requestId); it != pendingAdminRpcs.end()) {
+                    writeReply(it->second, msg->reply);
+                    pendingAdminRpcs.erase(it);
                 }
             } else if (std::get_if<MsgWebsocket::GracefulShutdown>(&newMsg.msg)) {
                 LW << "Initiating graceful shutdown: " << connIdToConnection.size() << " connections remaining";

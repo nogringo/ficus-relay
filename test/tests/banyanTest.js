@@ -138,6 +138,10 @@ const stranger = makeKey(); // replies to alice a lot, alice never answers
 const dave = makeKey(); // second tenant
 const admin = makeKey();
 const eve = makeKey(); // added through the admin API
+const zed = makeKey(); // alice zapped zed once, zed replies to alice: primary through a genuine zap
+const forger = makeKey(); // forges receipts saying alice zapped them, and reacts to alice a lot
+const flooder = makeKey(); // alice answered once, then floods alice with reactions
+const lnurl = makeKey(); // signs zap receipts, like an LNURL server
 
 function seedEvents() {
   const events = [];
@@ -160,6 +164,34 @@ function seedEvents() {
 
   for (let i = 0; i < 5; i++) {
     add(sign(stranger, { content: `stranger replies ${i}`, tags: [["e", a1.id], ["p", alice.pub]] }));
+  }
+
+  const zapRequest = sign(alice, { kind: 9734, tags: [["p", zed.pub], ["relays", "wss://relay.test"]] });
+  const receipt = (signer, recipient, description) => {
+    const tags = [["p", recipient.pub], ["P", alice.pub], ["bolt11", "lnbc1"]];
+    if (description) tags.push(["description", JSON.stringify(description)]);
+    return sign(signer, { kind: 9735, tags });
+  };
+
+  // Two receipts for the same zap request count once
+  add(receipt(lnurl, zed, zapRequest));
+  add(receipt(lnurl, zed, zapRequest));
+  for (let i = 0; i < 2; i++) {
+    add(sign(zed, { content: `zed replies ${i}`, tags: [["e", a1.id], ["p", alice.pub]] }));
+  }
+
+  add(receipt(forger, forger, null));
+  add(receipt(forger, forger, sign(forger, { kind: 9734, tags: [["p", forger.pub]] })));
+  add(receipt(forger, forger, zapRequest));
+  add(receipt(forger, forger, { ...zapRequest, tags: [["p", forger.pub]] }));
+  for (let i = 0; i < 10; i++) {
+    add(sign(forger, { kind: 7, content: "+", tags: [["e", a1.id], ["p", alice.pub]] }));
+  }
+
+  const f1 = add(sign(flooder, { content: "flooder note" }));
+  add(sign(alice, { content: "alice answers flooder", tags: [["e", f1.id], ["p", flooder.pub]] }));
+  for (let i = 0; i < 30; i++) {
+    add(sign(flooder, { kind: 7, content: "+", tags: [["e", a1.id], ["p", alice.pub]] }));
   }
 
   return events;
@@ -221,12 +253,43 @@ async function waitForHttp() {
   throw new Error("relay did not start");
 }
 
+function recompute(person) {
+  const out = strfry(["banyan", "recompute", person]);
+  const scores = new Map();
+  for (const line of out.trim().split("\n")) {
+    const [circle, npub, score] = line.split(" ");
+    scores.set(npub, { circle, score: Number(score) });
+  }
+  return { out, scores };
+}
+
 async function testTrustCircles() {
-  const out = strfry(["banyan", "recompute", "alice"]);
-  expect(out.includes(`primary ${bob.npub}`), `bob should be primary, got:\n${out}`);
-  expect(out.includes(`secondary ${carol.npub}`), `carol should be secondary, got:\n${out}`);
-  expect(!out.includes(stranger.npub), "a one-sided stranger must not enter the universe");
+  const { out, scores } = recompute("alice");
+  expect(scores.get(bob.npub)?.circle === "primary", `bob should be primary, got:\n${out}`);
+  expect(scores.get(carol.npub)?.circle === "secondary", `carol should be secondary, got:\n${out}`);
+  expect(!scores.has(stranger.npub), "a one-sided stranger must not enter the universe");
+
+  expect(!scores.has(forger.npub), `forged zap receipts must not count, got:\n${out}`);
+  expect(scores.get(zed.npub)?.circle === "primary", `a genuine zap counts, got:\n${out}`);
+  expect(scores.get(zed.npub).score < 5, `one zap request counts once whatever the number of receipts, got:\n${out}`);
+
+  const flood = scores.get(flooder.npub);
+  expect(flood && flood.score < scores.get(bob.npub).score, `flooding one direction can't outrank a mutual friend, got:\n${out}`);
   pass("testTrustCircles");
+}
+
+async function testBlockedFreeTheirSlot() {
+  strfry(["banyan", "set", "alice", JSON.stringify({ primaryCircleSize: 1, blocked: [bob.npub] })]);
+  recompute("alice");
+
+  const shown = JSON.parse(strfry(["banyan", "show", "alice"]));
+  const primary = shown.members.filter((m) => m.circle === "primary").map((m) => m.pubkey);
+  expect(primary.length === 1 && primary[0] === zed.pub, `the next peer takes a blocked member's slot, got ${JSON.stringify(primary)}`);
+  expect(!shown.members.some((m) => m.pubkey === carol.pub), "people reached only through a blocked member leave too");
+
+  strfry(["banyan", "set", "alice", JSON.stringify({ primaryCircleSize: 50, blocked: [] })]);
+  recompute("alice");
+  pass("testBlockedFreeTheirSlot");
 }
 
 async function testRootAndUnknownPathsRefused() {
@@ -386,6 +449,7 @@ async function main() {
   strfry(["banyan", "add", dave.pub, "dave"]);
 
   await testTrustCircles();
+  await testBlockedFreeTheirSlot();
 
   const relay = spawn("./strfry", ["--config", cfgPath, "relay"], { stdio: ["ignore", "pipe", "pipe"] });
   let logs = "";

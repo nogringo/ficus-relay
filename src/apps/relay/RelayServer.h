@@ -21,6 +21,7 @@
 #include "Decompressor.h"
 #include "PrometheusMetrics.h"
 #include "AuthSession.h"
+#include "apps/banyan/BanyanHttp.h"
 
 
 
@@ -44,7 +45,12 @@ struct MsgWebsocket : NonCopyable {
     struct GracefulShutdown {
     };
 
-    using Var = std::variant<Send, SendBinary, SendEventToBatch, GracefulShutdown>;
+    struct BanyanAdminReply {
+        uint64_t requestId;
+        banyan::HttpReply reply;
+    };
+
+    using Var = std::variant<Send, SendBinary, SendEventToBatch, GracefulShutdown, BanyanAdminReply>;
     Var msg;
     MsgWebsocket(Var &&msg_) : msg(std::move(msg_)) {}
 };
@@ -167,6 +173,17 @@ struct MsgNegentropy : NonCopyable {
     MsgNegentropy(Var &&msg_) : msg(std::move(msg_)) {}
 };
 
+struct MsgBanyanAdmin : NonCopyable {
+    struct Rpc {
+        uint64_t requestId;
+        banyan::HttpRequestInfo request;
+    };
+
+    using Var = std::variant<Rpc>;
+    Var msg;
+    MsgBanyanAdmin(Var &&msg_) : msg(std::move(msg_)) {}
+};
+
 struct RelayServerCtx {
     secp256k1_context *secpCtx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
     FilterValidator filterValidator;
@@ -185,6 +202,7 @@ struct RelayServer {
     ThreadPool<MsgReqWorker> tpReqWorker;
     ThreadPool<MsgReqMonitor> tpReqMonitor;
     ThreadPool<MsgNegentropy> tpNegentropy;
+    ThreadPool<MsgBanyanAdmin> tpBanyanAdmin;
     std::thread cronThread;
     std::thread signalHandlerThread;
     std::thread banyanTrustThread;
@@ -208,6 +226,8 @@ struct RelayServer {
     void runReqMonitor(ThreadPool<MsgReqMonitor>::Thread &thr);
 
     void runNegentropy(ThreadPool<MsgNegentropy>::Thread &thr);
+
+    void runBanyanAdmin(ThreadPool<MsgBanyanAdmin>::Thread &thr);
 
     void runCron();
 

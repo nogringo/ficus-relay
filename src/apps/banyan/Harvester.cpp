@@ -1,12 +1,15 @@
 #include <atomic>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <thread>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -49,11 +52,39 @@ tao::json::value harvesterStatus() {
 }
 
 
+static bool isPrivateIpv4(uint32_t addr) {
+    auto in = [&](uint32_t net, int bits){ return (addr >> (32 - bits)) == (net >> (32 - bits)); };
+
+    return in(0x00000000, 8) || in(0x0A000000, 8) || in(0x64400000, 10) || in(0x7F000000, 8) || in(0xA9FE0000, 16)
+        || in(0xAC100000, 12) || in(0xC0000000, 24) || in(0xC0A80000, 16) || in(0xC6120000, 15) || addr >= 0xE0000000;
+}
+
+static bool isPrivateAddress(const sockaddr *sa) {
+    if (sa->sa_family == AF_INET) return isPrivateIpv4(ntohl(((const sockaddr_in *)sa)->sin_addr.s_addr));
+    if (sa->sa_family != AF_INET6) return true;
+
+    const uint8_t *b = ((const sockaddr_in6 *)sa)->sin6_addr.s6_addr;
+    static const uint8_t v4MappedPrefix[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF };
+    static const uint8_t zeros[15] = {};
+
+    if (memcmp(b, v4MappedPrefix, 12) == 0) return isPrivateIpv4(uint32_t(b[12]) << 24 | uint32_t(b[13]) << 16 | uint32_t(b[14]) << 8 | b[15]);
+    if (memcmp(b, zeros, 15) == 0 && b[15] <= 1) return true;
+
+    return (b[0] & 0xFE) == 0xFC || (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) || b[0] == 0xFF;
+}
+
+// Literal addresses and local names only: hostnames are checked again once resolved, in probeTcp()
 static bool isPrivateHost(std::string_view host) {
     if (auto pos = host.rfind(':'); pos != std::string_view::npos && host.find(']') == std::string_view::npos) host = host.substr(0, pos);
+    if (host.ends_with('.')) host.remove_suffix(1);
 
-    return host == "localhost" || host.empty() || host.starts_with("127.") || host.starts_with("10.") || host.starts_with("192.168.")
-        || host.starts_with("0.") || host.starts_with("[") || host.ends_with(".onion") || host.ends_with(".local");
+    if (host.empty() || host.starts_with("[")) return true;
+    if (host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") || host.ends_with(".internal") || host.ends_with(".onion")) return true;
+
+    in_addr addr;
+    if (inet_pton(AF_INET, std::string(host).c_str(), &addr) == 1) return isPrivateIpv4(ntohl(addr.s_addr));
+
+    return false;
 }
 
 // Returns an empty string for URLs the harvester should not use
@@ -104,7 +135,9 @@ static tao::json::value hexArray(const std::vector<Bytes32> &pks) {
 
 // uWS resolves DNS and, on macOS, connects with blocking calls inside its event loop, so one dead
 // relay would freeze the harvester. Hosts are checked here first, on worker threads.
-static bool probeTcp(const std::string &url, int timeoutMs) {
+enum class ProbeResult { Reachable, Unreachable, PrivateAddress };
+
+static ProbeResult probeTcp(const std::string &url, int timeoutMs) {
     auto parts = parseRelayUrl(url);
     std::string host = parts.host;
     std::string port = url.starts_with("wss://") ? "443" : "80";
@@ -117,9 +150,14 @@ static bool probeTcp(const std::string &url, int timeoutMs) {
     addrinfo hints{}, *result = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &result) != 0) return false;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &result) != 0) return ProbeResult::Unreachable;
 
     // Same address uWS will use: the first one
+    if (isPrivateAddress(result->ai_addr)) {
+        freeaddrinfo(result);
+        return ProbeResult::PrivateAddress;
+    }
+
     bool ok = false;
     int fd = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
 
@@ -141,14 +179,14 @@ static bool probeTcp(const std::string &url, int timeoutMs) {
     }
 
     freeaddrinfo(result);
-    return ok;
+    return ok ? ProbeResult::Reachable : ProbeResult::Unreachable;
 }
 
 struct Prober {
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<std::string> pending;
-    std::vector<std::pair<std::string, bool>> results;
+    std::vector<std::pair<std::string, ProbeResult>> results;
 
     Prober(size_t numWorkers) {
         for (size_t i = 0; i < numWorkers; i++) {
@@ -163,10 +201,10 @@ struct Prober {
                         pending.pop_front();
                     }
 
-                    bool ok = probeTcp(url, 5'000);
+                    auto result = probeTcp(url, 5'000);
 
                     std::lock_guard<std::mutex> guard(mutex);
-                    results.emplace_back(url, ok);
+                    results.emplace_back(url, result);
                 }
             }).detach();
         }
@@ -180,7 +218,7 @@ struct Prober {
         cv.notify_one();
     }
 
-    std::vector<std::pair<std::string, bool>> takeResults() {
+    std::vector<std::pair<std::string, ProbeResult>> takeResults() {
         std::lock_guard<std::mutex> guard(mutex);
         return std::move(results);
     }
@@ -387,10 +425,12 @@ struct Harvester {
         });
     }
 
+    static constexpr uint64_t maxBackoffSeconds = 1800;
+
     static uint64_t backoffSeconds(uint64_t failures) {
         uint64_t delay = 10;
-        for (uint64_t i = 0; i < failures && delay < 1800; i++) delay *= 2;
-        return std::min<uint64_t>(delay, 1800);
+        for (uint64_t i = 0; i < failures && delay < maxBackoffSeconds; i++) delay *= 2;
+        return std::min<uint64_t>(delay, maxBackoffSeconds);
     }
 
 
@@ -608,18 +648,18 @@ struct Harvester {
             return;
         }
 
-        if (spec.scope == Scope::ZapsSent) return;
+        if (spec.scope != Scope::ZapsSent) {
+            auto &done = spec.scope == Scope::Authors ? r.backfilledAuthors : r.backfilledInbox;
+            for (const auto &pk : spec.pubkeys) done.insert(pk);
 
-        auto &done = spec.scope == Scope::Authors ? r.backfilledAuthors : r.backfilledInbox;
-        for (const auto &pk : spec.pubkeys) done.insert(pk);
-
-        try {
-            markBackfilled(spec.pubkeys, spec.scope, spec.chainStartedAt);
-        } catch (std::exception &e) {
-            LE << "Banyan harvester: unable to store backfill progress: " << e.what();
+            try {
+                markBackfilled(spec.pubkeys, spec.scope, spec.chainStartedAt);
+            } catch (std::exception &e) {
+                LE << "Banyan harvester: unable to store backfill progress: " << e.what();
+            }
         }
 
-        requestRecompute(0);
+        notifyEngagementChanged(spec.pubkeys);
     }
 
     void handleMessage(Relay &r, std::string_view msg) {
@@ -839,15 +879,19 @@ struct Harvester {
             LE << "Banyan harvester: planning failed: " << e.what();
         }
 
-        for (auto &[url, reachable] : prober.takeResults()) {
+        for (auto &[url, result] : prober.takeResults()) {
             auto it = relays.find(url);
             if (it == relays.end()) continue;
             auto &r = it->second;
             r.probing = false;
 
-            if (reachable) {
+            if (result == ProbeResult::Reachable) {
                 r.connecting = true;
                 hub.connect(url, (void*)new std::string(url), {}, 15'000, group);
+            } else if (result == ProbeResult::PrivateAddress) {
+                r.lastError = "resolves to a private address";
+                r.nextAttemptAt = now + maxBackoffSeconds;
+                LW << "Banyan harvester: " << url << " resolves to a private address, skipped";
             } else {
                 r.failures++;
                 r.lastError = "unreachable";

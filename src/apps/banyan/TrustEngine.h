@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <vector>
 
 #include "Tenants.h"
@@ -8,23 +9,41 @@
 namespace banyan {
 
 
-struct Engagement {
-    flat_hash_map<Bytes32, double> out; // seed -> peer
-    flat_hash_map<Bytes32, double> in;  // peer -> seed
+enum class EngagementType : uint8_t { Reply, Repost, Reaction, Zap, Mention, None };
+
+static constexpr size_t numEngagementTypes = size_t(EngagementType::None);
+
+// Decayed engagement between a seed and one peer, per type, before the tenant's weights are applied
+struct PeerEngagement {
+    Bytes32 peer;
+    std::array<double, numEngagementTypes> out{}; // seed -> peer
+    std::array<double, numEngagementTypes> in{};  // peer -> seed
 };
 
-Engagement computeEngagement(lmdb::txn &txn, const Bytes32 &seed, const TenantSettings &settings, uint64_t now);
+// Only peers with engagement in both directions, since the others always score zero
+std::vector<PeerEngagement> computeEngagement(const Bytes32 &seed, uint64_t now);
 
-// Mutual score: geometric mean of both directions, so one-sided attention scores zero
-std::vector<std::pair<Bytes32, double>> rankPeers(const Engagement &eng, double minScore);
+// Mutual score: sqrt(out * min(in, out)). Only out is signed by the seed, so inflating in never lifts a peer above the seed's own engagement.
+std::vector<std::pair<Bytes32, double>> rankPeers(const std::vector<PeerEngagement> &engagement, const TrustWeights &weights, double minScore);
+
+struct CachedEngagement {
+    uint64_t computedAt = 0;
+    std::vector<PeerEngagement> peers;
+};
+
+// Engagement is independent of tenant settings, so a seed shared by several tenants is computed once
+using EngagementCache = flat_hash_map<Bytes32, CachedEngagement>;
 
 // Primary and secondary circles of a tenant, computed from the events already in the DB
-std::vector<UniverseMember> computeUniverse(lmdb::txn &txn, const TenantView &tenant, uint64_t now);
+std::vector<UniverseMember> computeUniverse(const TenantView &tenant, uint64_t now, EngagementCache &cache);
 
 void runTrustEngine();
 
 // 0 means every tenant
 void requestRecompute(uint64_t tenantId);
+
+// The harvester fetched new history for these pubkeys: drops their cached engagement and recomputes the tenants they are seeds of
+void notifyEngagementChanged(const std::vector<Bytes32> &pubkeys);
 
 
 }

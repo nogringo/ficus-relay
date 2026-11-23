@@ -20,7 +20,7 @@ All events live once in the shared LMDB database. A virtual relay is a view over
 * the primary trust circle,
 * the secondary trust circle.
 
-Reads (`REQ`, `COUNT`, `NEG-OPEN` and live events) only return events whose author is in the universe. The scope is applied inside the DB scanner before `limit` is counted, so a `limit: 50` query returns 50 visible events. Filters on kinds alone walk the universe's authors instead of the whole kind index.
+Reads (`REQ`, `COUNT`, `NEG-OPEN` and live events) only return events whose author is in the universe. The scope is applied inside the DB scanner before `limit` is counted, so a `limit: 50` query returns 50 visible events. Filters on kinds alone walk the universe's authors instead of the whole kind index, up to 10,000 author and kind pairs.
 
 Gift wraps (`kind:1059`) are signed by random keys, so they are also served and accepted when their `p` tag is the owner (`banyan.acceptGiftWrapsForOwner`).
 
@@ -42,18 +42,20 @@ For a seed `S`, the engine reads what `S` published and what mentions `S`, withi
 | Repost (6, 16) | same | same |
 | Reaction (7) | same | same |
 | Mention, quote, article, highlight (1 without `e`, 30023, 9802) | same | same |
-| Zap (9735) | receipts with `P` = S | receipts with `p` = S, sender from `P` or the zap request |
+| Zap (9735) | receipts whose zap request S signed | receipts for S whose zap request X signed |
 
 Each engagement is weighted (per-person weights, defaults in `banyan.trust.weight*`), divided by the number of `p` tags of the event, and decays with a half-life of `banyan.trust.halfLifeDays`.
 
-The mutual score is the geometric mean of both directions, `sqrt(out * in)`, so one-sided attention (a stranger replying a lot, or you zapping someone who never answers) scores zero.
+Anyone can publish a zap receipt, so a zap only counts when the zap request in its `description` tag is validly signed by the sender and names the receipt's recipient. Each zap request counts once, however many receipts carry it.
+
+The mutual score is `sqrt(out * min(in, out))`, so one-sided attention (a stranger replying a lot, or you zapping someone who never answers) scores zero. Only `out` is signed by S, while anyone can publish events that mention S, so `in` never counts for more than `out`: flooding S with reactions can't lift someone above S's own engagement with them. For the same reason, incoming engagement is only read from people S engaged with, and a flood of mentions from strangers can't push real engagement out of the scan.
 
 * **Primary circle**: the owner's top `primaryCircleSize` peers with a score of at least `minScore`.
 * **Secondary circle**: for each primary or pinned person, their top `secondaryPerPeer` peers. A secondary member keeps the list of people it came through (`via`).
 
-Blocking is applied when the universe is loaded, not when it is computed, so blocking and unblocking take effect immediately. A secondary member whose every `via` is blocked disappears too.
+Blocking is applied when the universe is loaded, not when it is computed, so blocking and unblocking take effect immediately. A secondary member whose every `via` is blocked disappears too. Blocked people take no slot in the circles: blocking triggers a recompute, and the next peer moves up.
 
-The universe is recomputed every `banyan.trust.recomputeIntervalSeconds`, when an admin changes the settings, and shortly after the harvester finishes a backfill (at most every 30 seconds per person).
+The universe is recomputed every `banyan.trust.recomputeIntervalSeconds`, when an admin changes the settings, and shortly after the harvester finishes a backfill for one of its seeds (at most every 30 seconds per person). Engagement does not depend on settings, so it is cached per pubkey for 10 minutes and shared by every universe that pubkey seeds. A backfill drops the cached engagement of the pubkeys it fetched.
 
 ### Harvester
 
@@ -66,7 +68,7 @@ Pubkeys without a known relay list are looked up on `banyan.harvester.bootstrapR
 
 On each relay, the harvester opens live subscriptions (`since: now`) and pages backward through history (`until` pagination, `banyan.harvester.backfillDays` on the first run). Progress is stored per pubkey in the `HarvestState` table, so a restart only fetches what is new. Events are checked against the filter that requested them and their signatures are verified before being written.
 
-uWS resolves DNS and, on macOS, connects with blocking calls, so every relay is first probed on worker threads (DNS plus a TCP connect with a 5 second timeout). Dead relays back off exponentially up to 30 minutes.
+uWS resolves DNS and, on macOS, connects with blocking calls, so every relay is first probed on worker threads (DNS plus a TCP connect with a 5 second timeout). Dead relays back off exponentially up to 30 minutes. Relays on private, loopback, link-local or reserved addresses are skipped, both as written in relay lists and once the probe has resolved them.
 
 The loop that makes a Banyan grow:
 
@@ -102,7 +104,7 @@ Run `make` as usual: the `banyan` app is part of `APPS`. The full list of settin
 
 ## Admin API
 
-The admin page uses a NIP-86 style JSON-RPC endpoint: `POST /` with `Content-Type: application/nostr+json+rpc` and a NIP-98 `Authorization` header (kind 27235, `u` = `https://<host>/`, `method` = `POST`, `payload` = sha256 of the body). Responses are `{"result": ...}` or `{"error": "..."}`, with status 401 for a bad signature and 403 for a pubkey that is not in `banyan.admins`.
+The admin page uses a NIP-86 style JSON-RPC endpoint: `POST /` with `Content-Type: application/nostr+json+rpc` and a NIP-98 `Authorization` header (kind 27235, `u` = `https://<host>/`, `method` = `POST`, `payload` = sha256 of the body). Responses are `{"result": ...}` or `{"error": "..."}`, with status 401 for a bad signature and 403 for a pubkey that is not in `banyan.admins`. Calls run on their own thread, off the WebSocket event loop.
 
 | Method | Params | Result |
 |---|---|---|
@@ -133,7 +135,7 @@ A running relay picks up CLI changes within 5 seconds.
 
 ## Tests
 
-`test/tests/banyanTest.js` covers path routing, scoped reads, writes and live events, gift wraps, AUTH bound to the path, per-relay NIP-11, the admin API with NIP-98, and the trust circles on a small engagement graph. It needs [nak](https://github.com/fiatjaf/nak) on `PATH` to generate keys and sign events, and runs as part of `test/runTests.sh`. The other test suites run with `banyan.enabled = false`.
+`test/tests/banyanTest.js` covers path routing, scoped reads, writes and live events, gift wraps, AUTH bound to the path, per-relay NIP-11, the admin API with NIP-98, and the trust circles on a small engagement graph, including forged and duplicated zap receipts, one-sided floods and blocked members freeing their slot. It needs [nak](https://github.com/fiatjaf/nak) on `PATH` to generate keys and sign events, and runs as part of `test/runTests.sh`. The other test suites run with `banyan.enabled = false`.
 
 ## Not done yet
 
@@ -143,3 +145,5 @@ A running relay picks up CLI changes within 5 seconds.
 * NIP-42 AUTH towards upstream relays: relays that require it are skipped.
 * Letting owners manage their own virtual relay (pins, blocks, weights) through the API.
 * Weighting zaps by amount.
+* Checking zap receipts against the recipient's LNURL `nostrPubkey`: a signed zap request proves who meant to zap whom, not that the invoice was paid.
+* Connecting to the address the probe checked: uWS resolves the host again, so a DNS answer that changes in between (rebinding) is not caught.

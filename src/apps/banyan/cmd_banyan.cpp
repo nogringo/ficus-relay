@@ -74,11 +74,8 @@ void cmd_banyan(const std::vector<std::string> &subArgs) {
         auto t = findLoaded(args["<person>"].asString());
         uint64_t now = hoytech::curr_time_s();
 
-        std::vector<banyan::UniverseMember> members;
-        {
-            auto txn = env.txn_ro();
-            members = banyan::computeUniverse(txn, *t, now);
-        }
+        banyan::EngagementCache cache;
+        auto members = banyan::computeUniverse(*t, now, cache);
 
         auto txn = env.txn_rw();
         banyan::storeComputedUniverse(txn, t->id, now, members);

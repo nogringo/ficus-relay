@@ -61,6 +61,11 @@ void RelayServer::run() {
         if (s != 0) throw herr("Unable to set sigmask: ", strerror(errno));
     }
 
+    // Started even when Banyan is off: banyan.enabled can be switched on by a config reload
+    tpBanyanAdmin.init("BanyanAdmin", 1, [this](auto &thr){
+        runBanyanAdmin(thr);
+    });
+
     tpWebsocket.init("Websocket", 1, [this](auto &thr){
         runWebsocket(thr);
     });

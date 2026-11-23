@@ -2,6 +2,7 @@
 #include <condition_variable>
 #include <mutex>
 
+#include <secp256k1_schnorrsig.h>
 #include <hoytech/time.h>
 #include <hoytech/hex.h>
 
@@ -15,13 +16,15 @@
 namespace banyan {
 
 
-enum class EngagementType { None, Reply, Repost, Reaction, Zap, Mention };
-
-static const std::vector<uint64_t> engagementKinds = { 1, 6, 7, 16, 1111, 9735, 9802, 30023 };
+// Zap receipts (9735) are signed by neither side of the zap, so they are read separately
+static const std::vector<uint64_t> engagementKinds = { 1, 6, 7, 16, 1111, 9802, 30023 };
 
 // Upper bounds keep a very popular seed from pinning a read transaction for minutes; newest events come first.
 static const uint64_t maxOutgoingEvents = 20'000;
 static const uint64_t maxIncomingEvents = 50'000;
+static const uint64_t maxZapReceipts = 20'000;
+
+static const uint64_t engagementCacheSeconds = 600;
 
 
 static bool hasTag(const PackedEventView &ev, char name) {
@@ -43,7 +46,6 @@ static EngagementType classify(const PackedEventView &ev) {
         case 6:
         case 16: return EngagementType::Repost;
         case 7: return EngagementType::Reaction;
-        case 9735: return EngagementType::Zap;
         case 9802:
         case 30023: return EngagementType::Mention;
         default: return EngagementType::None;
@@ -61,6 +63,12 @@ static double weightOf(EngagementType t, const TrustWeights &w) {
     }
 }
 
+static double weighted(const std::array<double, numEngagementTypes> &v, const TrustWeights &w) {
+    double total = 0;
+    for (size_t i = 0; i < numEngagementTypes; i++) total += v[i] * weightOf(EngagementType(i), w);
+    return total;
+}
+
 static std::vector<Bytes32> pTags(const PackedEventView &ev, const Bytes32 &exclude) {
     std::vector<Bytes32> output;
 
@@ -75,49 +83,66 @@ static std::vector<Bytes32> pTags(const PackedEventView &ev, const Bytes32 &excl
     return output;
 }
 
-static std::optional<Bytes32> zapSender(lmdb::txn &txn, Decompressor &decomp, uint64_t levId, const PackedEventView &ev) {
+static std::optional<Bytes32> firstPTag(const PackedEventView &ev) {
     std::optional<Bytes32> output;
 
     ev.foreachTag([&](char tagName, std::string_view tagVal){
-        if (tagName == 'P' && tagVal.size() == 64) {
-            try {
-                output = Bytes32(from_hex(tagVal));
-            } catch (std::exception &) {
-            }
+        if (tagName == 'p' && tagVal.size() == 32) {
+            output = Bytes32(tagVal);
             return false;
         }
         return true;
     });
 
-    if (output) return output;
+    return output;
+}
 
-    // Older zap receipts only carry the sender inside the embedded zap request
+static secp256k1_context *verifyCtx() {
+    static secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+    return ctx;
+}
+
+struct ZapRequest {
+    std::string id;
+    Bytes32 sender;
+    Bytes32 recipient;
+};
+
+// NIP-57: anyone can publish a receipt, so only the zap request it embeds, signed by the sender, says who zapped whom
+static std::optional<ZapRequest> verifiedZapRequest(lmdb::txn &txn, Decompressor &decomp, uint64_t levId, const PackedEventView &receipt) {
+    auto receiptRecipient = firstPTag(receipt);
+    if (!receiptRecipient) return std::nullopt;
+
     try {
         auto json = tao::json::from_string(getEventJson(txn, decomp, levId));
+
         for (const auto &tag : json.at("tags").get_array()) {
             const auto &arr = tag.get_array();
-            if (arr.size() < 2 || arr[0].get_string() != "description") continue;
-            auto zapRequest = tao::json::from_string(arr[1].get_string());
-            output = Bytes32(from_hex(zapRequest.at("pubkey").get_string()));
-            break;
+            if (arr.size() < 2 || !arr[0].is_string() || arr[0].get_string() != "description") continue;
+
+            std::string packedStr, jsonStr;
+            parseAndVerifyEvent(tao::json::from_string(arr[1].get_string()), verifyCtx(), true, false, packedStr, jsonStr);
+            PackedEventView request(packedStr);
+
+            if (request.kind() != 9734) return std::nullopt;
+            if (firstPTag(request) != receiptRecipient) return std::nullopt;
+
+            return ZapRequest{ std::string(request.id()), Bytes32(request.pubkey()), *receiptRecipient };
         }
     } catch (std::exception &) {
     }
 
-    return output;
+    return std::nullopt;
 }
 
-static tao::json::value kindsJson() {
+static tao::json::value uintArray(const std::vector<uint64_t> &v) {
     tao::json::value arr = tao::json::empty_array;
-    for (auto k : engagementKinds) arr.emplace_back(k);
+    for (auto n : v) arr.emplace_back(n);
     return arr;
 }
 
 
-Engagement computeEngagement(lmdb::txn &txn, const Bytes32 &seed, const TenantSettings &settings, uint64_t now) {
-    Engagement eng;
-    Decompressor decomp;
-
+std::vector<PeerEngagement> computeEngagement(const Bytes32 &seed, uint64_t now) {
     uint64_t window = cfg().banyan__trust__windowDays * 86400;
     uint64_t since = now > window ? now - window : 0;
     double halfLife = (double)cfg().banyan__trust__halfLifeDays * 86400;
@@ -127,11 +152,21 @@ Engagement computeEngagement(lmdb::txn &txn, const Bytes32 &seed, const TenantSe
         return std::pow(0.5, (double)(now - created) / halfLife);
     };
 
+    flat_hash_map<Bytes32, PeerEngagement> peers;
+
+    auto entry = [&](const Bytes32 &pk) -> PeerEngagement & {
+        auto &e = peers[pk];
+        e.peer = pk;
+        return e;
+    };
+
     std::string seedHex = to_hex(seed.sv());
+    auto txn = env.txn_ro();
+    Decompressor decomp;
 
     foreachByFilter(txn, tao::json::value({
         { "authors", tao::json::value::array({ seedHex }) },
-        { "kinds", kindsJson() },
+        { "kinds", uintArray(engagementKinds) },
         { "since", since },
         { "limit", maxOutgoingEvents },
     }), [&](uint64_t levId){
@@ -139,34 +174,44 @@ Engagement computeEngagement(lmdb::txn &txn, const Bytes32 &seed, const TenantSe
         PackedEventView packed(ev.buf);
 
         auto type = classify(packed);
-        if (type == EngagementType::None || type == EngagementType::Zap) return;
+        if (type == EngagementType::None) return;
 
-        auto peers = pTags(packed, seed);
-        if (peers.empty()) return;
+        auto mentioned = pTags(packed, seed);
+        if (mentioned.empty()) return;
 
-        double w = weightOf(type, settings.weights) * decay(packed.created_at()) / (double)peers.size();
-        for (const auto &p : peers) eng.out[p] += w;
+        double w = decay(packed.created_at()) / (double)mentioned.size();
+        for (const auto &p : mentioned) entry(p).out[size_t(type)] += w;
     });
+
+    flat_hash_set<std::string> seenZapRequests;
 
     foreachByFilter(txn, tao::json::value({
         { "kinds", tao::json::value::array({ uint64_t(9735) }) },
         { "#P", tao::json::value::array({ seedHex }) },
         { "since", since },
-        { "limit", maxOutgoingEvents },
+        { "limit", maxZapReceipts },
     }), [&](uint64_t levId){
         auto ev = lookupEventByLevId(txn, levId);
         PackedEventView packed(ev.buf);
 
-        auto recipients = pTags(packed, seed);
-        if (recipients.empty()) return;
+        auto zap = verifiedZapRequest(txn, decomp, levId, packed);
+        if (!zap || zap->sender != seed || zap->recipient == seed) return;
+        if (!seenZapRequests.insert(zap->id).second) return;
 
-        double w = settings.weights.zap * decay(packed.created_at()) / (double)recipients.size();
-        for (const auto &r : recipients) eng.out[r] += w;
+        entry(zap->recipient).out[size_t(EngagementType::Zap)] += decay(packed.created_at());
     });
+
+    if (peers.empty()) return {};
+
+    // Peers the seed never engaged with score zero, so they are left out of the scan itself:
+    // a flood of mentions from strangers can't push real engagement past the limit.
+    tao::json::value candidates = tao::json::empty_array;
+    for (const auto &[pk, e] : peers) candidates.emplace_back(to_hex(pk.sv()));
 
     foreachByFilter(txn, tao::json::value({
         { "#p", tao::json::value::array({ seedHex }) },
-        { "kinds", kindsJson() },
+        { "authors", candidates },
+        { "kinds", uintArray(engagementKinds) },
         { "since", since },
         { "limit", maxIncomingEvents },
     }), [&](uint64_t levId){
@@ -176,36 +221,49 @@ Engagement computeEngagement(lmdb::txn &txn, const Bytes32 &seed, const TenantSe
         auto type = classify(packed);
         if (type == EngagementType::None) return;
 
-        double d = decay(packed.created_at());
-
-        if (type == EngagementType::Zap) {
-            auto sender = zapSender(txn, decomp, levId, packed);
-            if (!sender || *sender == seed) return;
-            eng.in[*sender] += settings.weights.zap * d;
-            return;
-        }
-
         Bytes32 author(packed.pubkey());
-        if (author == seed) return;
-
         auto mentioned = pTags(packed, author);
         if (mentioned.empty()) return;
 
-        eng.in[author] += weightOf(type, settings.weights) * d / (double)mentioned.size();
+        entry(author).in[size_t(type)] += decay(packed.created_at()) / (double)mentioned.size();
     });
 
-    return eng;
+    foreachByFilter(txn, tao::json::value({
+        { "kinds", tao::json::value::array({ uint64_t(9735) }) },
+        { "#p", tao::json::value::array({ seedHex }) },
+        { "#P", candidates },
+        { "since", since },
+        { "limit", maxZapReceipts },
+    }), [&](uint64_t levId){
+        auto ev = lookupEventByLevId(txn, levId);
+        PackedEventView packed(ev.buf);
+
+        auto zap = verifiedZapRequest(txn, decomp, levId, packed);
+        if (!zap || zap->recipient != seed || zap->sender == seed || !peers.contains(zap->sender)) return;
+        if (!seenZapRequests.insert(zap->id).second) return;
+
+        entry(zap->sender).in[size_t(EngagementType::Zap)] += decay(packed.created_at());
+    });
+
+    std::vector<PeerEngagement> output;
+
+    for (const auto &[pk, e] : peers) {
+        bool mutual = std::any_of(e.in.begin(), e.in.end(), [](double v){ return v > 0; });
+        if (mutual) output.push_back(e);
+    }
+
+    return output;
 }
 
-std::vector<std::pair<Bytes32, double>> rankPeers(const Engagement &eng, double minScore) {
+std::vector<std::pair<Bytes32, double>> rankPeers(const std::vector<PeerEngagement> &engagement, const TrustWeights &weights, double minScore) {
     std::vector<std::pair<Bytes32, double>> output;
 
-    for (const auto &[peer, out] : eng.out) {
-        auto it = eng.in.find(peer);
-        if (it == eng.in.end()) continue;
+    for (const auto &e : engagement) {
+        double out = weighted(e.out, weights);
+        double in = weighted(e.in, weights);
 
-        double score = std::sqrt(out * it->second);
-        if (score > 0 && score >= minScore) output.emplace_back(peer, score);
+        double score = std::sqrt(out * std::min(in, out));
+        if (score > 0 && score >= minScore) output.emplace_back(e.peer, score);
     }
 
     std::sort(output.begin(), output.end(), [](const auto &a, const auto &b){
@@ -216,22 +274,37 @@ std::vector<std::pair<Bytes32, double>> rankPeers(const Engagement &eng, double 
     return output;
 }
 
-std::vector<UniverseMember> computeUniverse(lmdb::txn &txn, const TenantView &tenant, uint64_t now) {
+std::vector<UniverseMember> computeUniverse(const TenantView &tenant, uint64_t now, EngagementCache &cache) {
     const auto &st = tenant.settings;
 
-    // Blocked people are filtered when the registry loads, so blocking and unblocking need no recompute
+    auto ranked = [&](const Bytes32 &seed){
+        auto it = cache.find(seed);
+
+        if (it == cache.end() || now >= it->second.computedAt + engagementCacheSeconds) {
+            auto &c = cache[seed];
+            c.computedAt = now;
+            c.peers = computeEngagement(seed, now);
+            return rankPeers(c.peers, st.weights, st.minScore);
+        }
+
+        return rankPeers(it->second.peers, st.weights, st.minScore);
+    };
+
     flat_hash_set<Bytes32> excluded;
     excluded.insert(tenant.pubkey);
     for (const auto &pk : st.pinned) excluded.insert(pk);
 
+    // Blocked people take no slot but stay in the stored list: the registry hides them when it loads, so unblocking is immediate
     std::vector<UniverseMember> primary;
     flat_hash_set<Bytes32> primarySet;
+    uint64_t primaryTaken = 0;
 
-    for (const auto &[peer, score] : rankPeers(computeEngagement(txn, tenant.pubkey, st, now), st.minScore)) {
-        if (primary.size() >= st.primaryCircleSize) break;
+    for (const auto &[peer, score] : ranked(tenant.pubkey)) {
+        if (primaryTaken >= st.primaryCircleSize) break;
         if (excluded.contains(peer)) continue;
         primary.push_back(UniverseMember{ peer, Circle::Primary, score, {} });
         primarySet.insert(peer);
+        if (!st.isBlocked(peer)) primaryTaken++;
     }
 
     // Pinned people are trusted by hand, so their own peers count like those of primary members
@@ -246,11 +319,11 @@ std::vector<UniverseMember> computeUniverse(lmdb::txn &txn, const TenantView &te
         for (const auto &seed : secondarySeeds) {
             uint64_t takenFromSeed = 0;
 
-            for (const auto &[peer, score] : rankPeers(computeEngagement(txn, seed, st, now), st.minScore)) {
+            for (const auto &[peer, score] : ranked(seed)) {
                 if (takenFromSeed >= st.secondaryPerPeer) break;
                 if (excluded.contains(peer) || primarySet.contains(peer)) continue;
 
-                takenFromSeed++;
+                if (!st.isBlocked(peer)) takenFromSeed++;
 
                 if (auto it = secondaryIndex.find(peer); it != secondaryIndex.end()) {
                     auto &m = secondary[it->second];
@@ -279,6 +352,7 @@ std::vector<UniverseMember> computeUniverse(lmdb::txn &txn, const TenantView &te
 static std::mutex requestMutex;
 static std::condition_variable requestCv;
 static flat_hash_set<uint64_t> requestedTenants;
+static flat_hash_set<Bytes32> changedPubkeys;
 static bool requestedAll = false;
 
 void requestRecompute(uint64_t tenantId) {
@@ -290,21 +364,33 @@ void requestRecompute(uint64_t tenantId) {
     requestCv.notify_one();
 }
 
+void notifyEngagementChanged(const std::vector<Bytes32> &pubkeys) {
+    {
+        std::lock_guard<std::mutex> guard(requestMutex);
+        changedPubkeys.insert(pubkeys.begin(), pubkeys.end());
+    }
+    requestCv.notify_one();
+}
+
 void runTrustEngine() {
     setThreadName("BanyanTrust");
 
     const uint64_t minSecondsBetweenRuns = 30;
     flat_hash_map<uint64_t, uint64_t> lastRun;
     flat_hash_set<uint64_t> pending;
+    flat_hash_set<Bytes32> changed;
+    EngagementCache cache;
 
     while (1) {
         bool all = false;
 
         {
             std::unique_lock<std::mutex> lk(requestMutex);
-            requestCv.wait_for(lk, std::chrono::seconds(5), [&]{ return requestedAll || requestedTenants.size(); });
+            requestCv.wait_for(lk, std::chrono::seconds(5), [&]{ return requestedAll || requestedTenants.size() || changedPubkeys.size(); });
             for (auto id : requestedTenants) pending.insert(id);
             requestedTenants.clear();
+            changed.insert(changedPubkeys.begin(), changedPubkeys.end());
+            changedPubkeys.clear();
             all = requestedAll;
             requestedAll = false;
         }
@@ -312,14 +398,30 @@ void runTrustEngine() {
         try {
             TenantRegistry::reload();
             auto snap = TenantRegistry::get();
-            bool changed = false;
+            uint64_t now = hoytech::curr_time_s();
+            bool universeChanged = false;
 
-            if (all) {
-                for (const auto &t : snap->tenants) pending.insert(t->id);
+            for (const auto &pk : changed) cache.erase(pk);
+
+            for (const auto &t : snap->tenants) {
+                if (all) pending.insert(t->id);
+
+                for (const auto &m : t->members) {
+                    if (t->isSeed(m) && changed.contains(m.pubkey)) {
+                        pending.insert(t->id);
+                        break;
+                    }
+                }
+            }
+
+            changed.clear();
+
+            for (auto it = cache.begin(); it != cache.end(); ) {
+                if (now >= it->second.computedAt + engagementCacheSeconds) cache.erase(it++);
+                else ++it;
             }
 
             for (const auto &t : snap->tenants) {
-                uint64_t now = hoytech::curr_time_s();
                 bool due = now >= t->computedAt + cfg().banyan__trust__recomputeIntervalSeconds;
                 bool asked = pending.contains(t->id);
 
@@ -327,12 +429,7 @@ void runTrustEngine() {
                 if (auto it = lastRun.find(t->id); it != lastRun.end() && now < it->second + minSecondsBetweenRuns) continue;
 
                 auto t0 = hoytech::curr_time_us();
-                std::vector<UniverseMember> members;
-
-                {
-                    auto txn = env.txn_ro();
-                    members = computeUniverse(txn, *t, now);
-                }
+                auto members = computeUniverse(*t, now, cache);
 
                 {
                     auto txn = env.txn_rw();
@@ -347,7 +444,7 @@ void runTrustEngine() {
 
                 lastRun[t->id] = now;
                 pending.erase(t->id);
-                changed = true;
+                universeChanged = true;
             }
 
             for (auto it = pending.begin(); it != pending.end(); ) {
@@ -355,7 +452,7 @@ void runTrustEngine() {
                 else ++it;
             }
 
-            if (changed) {
+            if (universeChanged) {
                 TenantRegistry::reload();
                 harvesterWake();
             }

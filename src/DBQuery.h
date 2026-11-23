@@ -103,13 +103,16 @@ struct DBScan : NonCopyable {
     uint64_t nextInitIndex = 0;
     uint64_t approxWork = 0;
 
+    // One seek per cursor is cheap next to walking every tenant's events by kind
+    static constexpr uint64_t maxScopeCursors = 10'000;
+
     DBScan(const NostrFilter &f, const banyan::TenantView *scope = nullptr) : f(f), scope(scope) {
         indexOnly = f.indexOnlyScans && !scope;
 
         // A scoped filter on kinds alone would walk every tenant's events, so walk the universe's authors instead.
         // Gift wraps are signed by random keys, so filters that may match them keep the regular scan.
         std::vector<std::string> scopeAuthors;
-        if (scope && !f.ids && f.tags.empty() && !f.authors && f.kinds && scope->universe.size() * f.kinds->size() < 1'000) {
+        if (scope && !f.ids && f.tags.empty() && !f.authors && f.kinds && scope->universe.size() * f.kinds->size() <= maxScopeCursors) {
             bool mayMatchGiftWraps = false;
             for (uint64_t j = 0; j < f.kinds->size(); j++) {
                 if (f.kinds->at(j) == 1059 || f.kinds->at(j) == 21059) mayMatchGiftWraps = true;
