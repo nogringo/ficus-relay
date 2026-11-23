@@ -4,6 +4,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,4 +26,4 @@ jobs:
       - name: Set lowercase owner
         run: echo "OWNER=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
       - name: Build the Docker image
-        run: docker buildx build -t ghcr.io/${{ env.OWNER }}/strfry:latest --platform linux/amd64 --platform linux/arm64 --push .
+        run: docker buildx build -t ghcr.io/${{ env.OWNER }}/ficus-relay:latest --platform linux/amd64 --platform linux/arm64 --push .

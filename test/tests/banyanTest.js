@@ -1,6 +1,5 @@
 // Banyan virtual relays: path routing, universe scoping, incoming engagement, trust circles, admin API, thread filters,
 // owner self-management, pruning, and the harvester's NIP-42 AUTH and inbox delivery against a fake upstream relay.
-// Needs `nak` (https://github.com/fiatjaf/nak) on PATH to generate keys and sign events.
 
 import os from "node:os";
 import path from "node:path";
@@ -10,7 +9,8 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { WebSocketServer } from "ws";
 import { matchFilters } from "@nostr/tools/filter";
-import { verifyEvent } from "@nostr/tools/pure";
+import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from "@nostr/tools/pure";
+import { npubEncode } from "@nostr/tools/nip19";
 
 const workDir = path.join(os.tmpdir(), "strfry-banyan-tests");
 const dbDir = path.join(workDir, "db");
@@ -27,14 +27,10 @@ function expect(cond, msg) {
   if (!cond) throw new Error(`Assertion failed: ${msg}`);
 }
 
-function nak(args, input) {
-  return execFileSync("nak", args, { encoding: "utf-8", input, stdio: ["pipe", "pipe", "ignore"] }).trim();
-}
-
 function makeKey() {
-  const sec = nak(["key", "generate"]);
-  const pub = nak(["key", "public", sec]);
-  return { sec, pub, npub: nak(["encode", "npub", pub]) };
+  const sec = generateSecretKey();
+  const pub = getPublicKey(sec);
+  return { sec, pub, npub: npubEncode(pub) };
 }
 
 let ts = Math.floor(Date.now() / 1000) - 10 * 86400;
@@ -52,9 +48,7 @@ async function until(what, fn, timeoutMs = 20000) {
 }
 
 function sign(key, { kind = 1, content = "", tags = [], created_at } = {}) {
-  const args = ["event", "--sec", key.sec, "-k", String(kind), "-c", content, "--ts", String(created_at ?? ts++)];
-  for (const t of tags) args.push("-t", `${t[0]}=${t.slice(1).join(";")}`);
-  return JSON.parse(nak(args));
+  return finalizeEvent({ kind, content, tags, created_at: created_at ?? ts++ }, key.sec);
 }
 
 function strfry(args, input) {
