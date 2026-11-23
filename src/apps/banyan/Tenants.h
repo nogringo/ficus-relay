@@ -41,6 +41,7 @@ struct TenantSettings {
     double minScore = 0;
     std::vector<Bytes32> pinned;
     std::vector<Bytes32> blocked;
+    std::vector<std::string> mutedThreads; // 32-byte event ids
 
     // Stored settings only hold explicit overrides, so config defaults keep applying to the rest.
     static TenantSettings effective(std::string_view storedJson);
@@ -57,6 +58,17 @@ struct UniverseMember {
     double score = 0;
     std::vector<Bytes32> via;
 };
+
+// Every event under a muted root: the roots, and what references them through e tags, or a tags for addressable events
+struct MutedThreads {
+    flat_hash_set<Bytes32> events;
+    flat_hash_set<std::string> coords; // "kind:pubkey:d"
+    size_t fromSettings = 0;
+    size_t fromMuteList = 0; // e tags of the owner's NIP-51 mute list (kind 10000)
+
+    bool hides(const PackedEventView &ev) const;
+};
+
 
 std::string serializeComputedMembers(const std::vector<UniverseMember> &members);
 std::vector<UniverseMember> parseComputedMembers(std::string_view json);
@@ -80,14 +92,25 @@ struct TenantView {
     // Whose incoming engagement the trust engine reads: owner, pinned and primary, blocked ones included
     flat_hash_set<Bytes32> trustSeeds;
 
+    std::shared_ptr<const MutedThreads> muted;
+
     bool inUniverse(std::string_view pubkey) const {
         return universe.contains(Bytes32(pubkey));
     }
 
     bool isGiftWrapForOwner(const PackedEventView &ev) const;
 
-    bool canSee(const PackedEventView &ev) const {
+    bool inScope(const PackedEventView &ev) const {
         return inUniverse(ev.pubkey()) || isGiftWrapForOwner(ev);
+    }
+
+    bool isMuted(const PackedEventView &ev) const {
+        return muted && muted->hides(ev);
+    }
+
+    // Muting only hides: writes in a muted thread are still accepted
+    bool canSee(const PackedEventView &ev) const {
+        return inScope(ev) && !isMuted(ev);
     }
 
     // Also accepts, without serving them, what the trust engine needs from people outside the universe
@@ -107,6 +130,7 @@ using TenantPtr = std::shared_ptr<const TenantView>;
 
 struct TenantSnapshot {
     uint64_t version = 0;
+    uint64_t universeVersion = 0; // like version, but not bumped when only muted threads grow
     std::vector<TenantPtr> tenants;
     flat_hash_map<uint64_t, TenantPtr> byId;
     flat_hash_map<std::string, TenantPtr> byPath; // slug and npub
@@ -137,6 +161,9 @@ Bytes32 parsePubkey(std::string_view input);
 std::string toNpub(const Bytes32 &pk);
 
 void validateSlug(std::string_view slug);
+
+// Hex, note1 or nevent1. Returns the 32-byte id.
+std::string parseEventId(std::string_view input);
 
 struct RelayUrlParts {
     std::string host;

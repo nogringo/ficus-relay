@@ -6,6 +6,8 @@
 #include "Tenants.h"
 #include "TrustEngine.h"
 #include "Bech32Utils.h"
+#include "DBQuery.h"
+#include "ThreadFilter.h"
 #include "events.h"
 
 
@@ -66,6 +68,30 @@ static tao::json::value pubkeyArrayToJson(const std::vector<Bytes32> &pks) {
     return arr;
 }
 
+static const size_t maxMutedThreads = 10'000;
+
+static std::vector<std::string> parseEventIdArray(const tao::json::value &v) {
+    if (!v.is_array()) throw herr("mutedThreads must be an array of event ids");
+    if (v.get_array().size() > maxMutedThreads) throw herr("at most ", maxMutedThreads, " muted threads");
+
+    std::vector<std::string> output;
+    flat_hash_set<std::string> seen;
+
+    for (const auto &e : v.get_array()) {
+        if (!e.is_string()) throw herr("mutedThreads must be an array of event ids");
+        auto id = parseEventId(e.get_string());
+        if (seen.insert(id).second) output.push_back(id);
+    }
+
+    return output;
+}
+
+static tao::json::value idArrayToJson(const std::vector<std::string> &ids) {
+    tao::json::value arr = tao::json::empty_array;
+    for (const auto &id : ids) arr.emplace_back(to_hex(id));
+    return arr;
+}
+
 
 TenantSettings TenantSettings::effective(std::string_view storedJson) {
     TenantSettings s;
@@ -99,6 +125,7 @@ TenantSettings TenantSettings::effective(std::string_view storedJson) {
     if (auto it = obj.find("minScore"); it != obj.end()) s.minScore = jsonNumber(it->second, "minScore");
     if (auto it = obj.find("pinned"); it != obj.end()) s.pinned = parsePubkeyArray(it->second, "pinned");
     if (auto it = obj.find("blocked"); it != obj.end()) s.blocked = parsePubkeyArray(it->second, "blocked");
+    if (auto it = obj.find("mutedThreads"); it != obj.end()) s.mutedThreads = parseEventIdArray(it->second);
 
     return s;
 }
@@ -130,6 +157,8 @@ std::string TenantSettings::mergePatch(std::string_view storedJson, const tao::j
             stored[k] = n;
         } else if (k == "pinned" || k == "blocked") {
             stored[k] = pubkeyArrayToJson(parsePubkeyArray(v, k));
+        } else if (k == "mutedThreads") {
+            stored[k] = idArrayToJson(parseEventIdArray(v));
         } else {
             throw herr("unknown setting: ", k);
         }
@@ -152,6 +181,7 @@ tao::json::value TenantSettings::toJson() const {
         { "minScore", minScore },
         { "pinned", pubkeyArrayToJson(pinned) },
         { "blocked", pubkeyArrayToJson(blocked) },
+        { "mutedThreads", idArrayToJson(mutedThreads) },
     });
 }
 
@@ -193,6 +223,21 @@ std::vector<UniverseMember> parseComputedMembers(std::string_view json) {
     }
 
     return output;
+}
+
+
+bool MutedThreads::hides(const PackedEventView &ev) const {
+    if (events.contains(Bytes32(ev.id()))) return true;
+
+    bool found = false;
+
+    ev.foreachTag([&](char tagName, std::string_view tagVal){
+        if (tagName == 'e' && tagVal.size() == 32) found = events.contains(Bytes32(tagVal));
+        else if (tagName == 'a' && coords.size()) found = coords.contains(std::string(tagVal));
+        return !found;
+    });
+
+    return found;
 }
 
 
@@ -245,7 +290,7 @@ static bool deletesStoredEvent(lmdb::txn &txn, const PackedEventView &deletion) 
 }
 
 bool TenantView::canWrite(lmdb::txn &txn, const PackedEventView &ev) const {
-    if (canSee(ev)) return true;
+    if (inScope(ev)) return true;
 
     if (cfg().banyan__acceptIncomingEngagement && isEngagementWith(ev, trustSeeds, trustWindowStart(hoytech::curr_time_s()))) return true;
 
@@ -323,11 +368,135 @@ static TenantPtr buildTenantView(uint64_t id, std::string_view pubkey, std::stri
 
 static std::mutex reloadMutex;
 
+// Owned by the reload: the muted events of each tenant, grown as replies arrive
+struct MuteTracker {
+    std::vector<std::string> roots; // sorted
+    size_t fromSettings = 0, fromMuteList = 0;
+    std::unique_ptr<ThreadState> thread;
+    uint64_t upTo = 0; // last levId looked at
+    bool dirty = false;
+    size_t publishedEvents = 0, publishedCoords = 0;
+    std::shared_ptr<const MutedThreads> published;
+};
+
+static flat_hash_map<uint64_t, MuteTracker> muteTrackers;
+
+// Bounds the time a reload spends catching up, after a big import for example
+static const uint64_t maxMuteScanPerReload = 200'000;
+
+static std::vector<std::string> muteListThreads(lmdb::txn &txn, const Bytes32 &owner) {
+    std::vector<std::string> output;
+
+    foreachByFilter(txn, tao::json::value({
+        { "authors", tao::json::value::array({ to_hex(owner.sv()) }) },
+        { "kinds", tao::json::value::array({ uint64_t(10000) }) },
+        { "limit", uint64_t(1) },
+    }), [&](uint64_t levId){
+        auto ev = lookupEventByLevId(txn, levId);
+        PackedEventView(ev.buf).foreachTag([&](char tagName, std::string_view tagVal){
+            if (tagName == 'e' && tagVal.size() == 32) output.emplace_back(tagVal);
+            return true;
+        });
+    });
+
+    return output;
+}
+
+static void updateMuteRoots(lmdb::txn &txn, const TenantView &t, uint64_t latest) {
+    auto fromList = muteListThreads(txn, t.pubkey);
+
+    std::vector<std::string> roots = t.settings.mutedThreads;
+    roots.insert(roots.end(), fromList.begin(), fromList.end());
+    std::sort(roots.begin(), roots.end());
+    roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+
+    auto &tr = muteTrackers[t.id];
+    tr.fromSettings = t.settings.mutedThreads.size();
+    if (tr.fromMuteList != fromList.size()) tr.dirty = true;
+    tr.fromMuteList = fromList.size();
+
+    if (roots == tr.roots) return;
+
+    tr.roots = roots;
+    tr.thread.reset();
+    tr.dirty = true;
+
+    if (roots.empty()) return;
+
+    tr.thread = std::make_unique<ThreadState>();
+    tr.thread->maxNodes = std::max<uint64_t>(cfg().banyan__threads__maxMutedEvents, roots.size());
+    for (const auto &id : roots) {
+        tr.thread->roots.push_back(id);
+        tr.thread->nodes.insert(Bytes32(id));
+    }
+
+    expandThread(txn, *tr.thread, nullptr, latest);
+    tr.upTo = latest;
+}
+
+// Unscoped: a reply from the universe to a stranger's reply in a muted thread is muted too
+static void growMutedThreads(lmdb::txn &txn, uint64_t latest) {
+    uint64_t from = MAX_U64;
+    for (const auto &[id, tr] : muteTrackers) {
+        if (tr.thread && tr.upTo < latest) from = std::min(from, tr.upTo);
+    }
+    if (from == MAX_U64) return;
+
+    uint64_t processed = 0, last = from;
+    bool complete = true;
+
+    env.foreach_Event(txn, [&](auto &ev){
+        if (processed++ >= maxMuteScanPerReload) {
+            complete = false;
+            return false;
+        }
+
+        last = ev.primaryKeyId;
+        PackedEventView packed(ev.buf);
+
+        for (auto &[id, tr] : muteTrackers) {
+            if (!tr.thread || tr.upTo >= ev.primaryKeyId || !tr.thread->contains(packed)) continue;
+            absorbIntoThread(txn, *tr.thread, nullptr, packed, ev.primaryKeyId, [](char, std::string_view){}, [](uint64_t, const PackedEventView &){});
+        }
+
+        return true;
+    }, false, from + 1);
+
+    uint64_t reached = complete ? latest : last;
+    for (auto &[id, tr] : muteTrackers) {
+        if (tr.thread) tr.upTo = std::max(tr.upTo, reached);
+    }
+}
+
+static std::shared_ptr<const MutedThreads> publishMutes(uint64_t tenantId) {
+    auto &tr = muteTrackers[tenantId];
+
+    if (!tr.thread) {
+        tr.published.reset();
+    } else if (tr.dirty || tr.thread->nodes.size() != tr.publishedEvents || tr.thread->coords.size() != tr.publishedCoords) {
+        auto m = std::make_shared<MutedThreads>();
+        m->events = tr.thread->nodes;
+        m->coords = tr.thread->coords;
+        m->fromSettings = tr.fromSettings;
+        m->fromMuteList = tr.fromMuteList;
+        tr.publishedEvents = m->events.size();
+        tr.publishedCoords = m->coords.size();
+        tr.published = std::move(m);
+    }
+
+    tr.dirty = false;
+    return tr.published;
+}
+
 // Callers hold reloadMutex and opened txn after taking it, so a reload never publishes data older than the previous one
 static void reloadLocked(lmdb::txn &txn) {
     auto prev = TenantRegistry::get();
     auto snap = std::make_shared<TenantSnapshot>();
     snap->version = prev->version + 1;
+
+    uint64_t latest = getMostRecentLevId(txn);
+    std::vector<TenantPtr> bases;
+    bool universeChanged = false;
 
     env.foreach_Tenant(txn, [&](auto &view){
         uint64_t computedAt = 0;
@@ -345,15 +514,39 @@ static void reloadLocked(lmdb::txn &txn) {
             t = old;
         } else {
             t = buildTenantView(view.primaryKeyId, view.pubkey(), view.slug(), view.addedAt(), view.settings(), computedAt, computedJson);
+            universeChanged = true;
+        }
+
+        bases.push_back(t);
+        return true;
+    });
+
+    if (bases.size() != prev->tenants.size()) universeChanged = true;
+
+    flat_hash_set<uint64_t> live;
+    for (const auto &t : bases) live.insert(t->id);
+    for (auto it = muteTrackers.begin(); it != muteTrackers.end(); ) {
+        if (!live.contains(it->first)) muteTrackers.erase(it++);
+        else ++it;
+    }
+
+    for (const auto &t : bases) updateMuteRoots(txn, *t, latest);
+    growMutedThreads(txn, latest);
+
+    for (const auto &base : bases) {
+        TenantPtr t = base;
+
+        if (auto muted = publishMutes(base->id); muted != base->muted) {
+            auto copy = std::make_shared<TenantView>(*base);
+            copy->muted = std::move(muted);
+            t = copy;
         }
 
         snap->tenants.push_back(t);
         snap->byId[t->id] = t;
         snap->byPath[t->slug] = t;
         snap->byPath[t->npub] = t;
-
-        return true;
-    });
+    }
 
     bool changed = prev->tenants.size() != snap->tenants.size();
     for (size_t i = 0; !changed && i < snap->tenants.size(); i++) {
@@ -361,6 +554,8 @@ static void reloadLocked(lmdb::txn &txn) {
     }
 
     if (!changed) return;
+
+    snap->universeVersion = prev->universeVersion + (universeChanged ? 1 : 0);
 
     std::lock_guard<std::mutex> guard(registryMutex);
     registryCurrent = snap;
@@ -390,6 +585,34 @@ Bytes32 parsePubkey(std::string_view input) {
 
 std::string toNpub(const Bytes32 &pk) {
     return encodeBech32Simple("npub", pk.sv());
+}
+
+std::string parseEventId(std::string_view input) {
+    while (input.size() && isspace((unsigned char)input.front())) input.remove_prefix(1);
+    while (input.size() && isspace((unsigned char)input.back())) input.remove_suffix(1);
+    if (input.starts_with("nostr:")) input.remove_prefix(6);
+
+    if (input.starts_with("note1")) return decodeBech32Simple(input);
+
+    // NIP-19 TLV: type 0 holds the id
+    if (input.starts_with("nevent1")) {
+        auto raw = decodeBech32(input);
+        for (size_t i = 0; i + 2 <= raw.size(); ) {
+            uint8_t type = raw[i], len = raw[i + 1];
+            if (i + 2 + len > raw.size()) break;
+            if (type == 0 && len == 32) return raw.substr(i + 2, 32);
+            i += 2 + len;
+        }
+        throw herr("nevent without an event id");
+    }
+
+    if (input.size() == 64) {
+        std::string lower(input);
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c){ return std::tolower(c); });
+        return from_hex(lower);
+    }
+
+    throw herr("invalid event id, expected hex, note1 or nevent1");
 }
 
 void validateSlug(std::string_view slug) {
@@ -457,6 +680,7 @@ uint64_t addTenant(lmdb::txn &txn, const Bytes32 &pubkey, std::string_view slug)
 
 void removeTenant(lmdb::txn &txn, uint64_t tenantId) {
     env.delete_TenantUniverse(txn, tenantId);
+    env.delete_TenantSigner(txn, tenantId);
     env.delete_Tenant(txn, tenantId);
 }
 

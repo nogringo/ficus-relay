@@ -1,4 +1,3 @@
-#include <openssl/evp.h>
 #include <secp256k1_schnorrsig.h>
 #include <hoytech/time.h>
 #include <hoytech/hex.h>
@@ -6,6 +5,7 @@
 #include "BanyanHttp.h"
 #include "TrustEngine.h"
 #include "Harvester.h"
+#include "RemoteSigner.h"
 #include "events.h"
 #include "DBQuery.h"
 #include "Decompressor.h"
@@ -58,24 +58,6 @@ static std::string toLower(std::string_view s) {
     return output;
 }
 
-static std::string base64Decode(std::string_view in) {
-    std::string clean;
-    for (char c : in) {
-        if (!isspace((unsigned char)c)) clean += c;
-    }
-
-    if (clean.empty() || clean.size() % 4 != 0) throw herr("invalid base64");
-
-    std::string output(clean.size() / 4 * 3, '\0');
-    int n = EVP_DecodeBlock((unsigned char*)output.data(), (const unsigned char*)clean.data(), (int)clean.size());
-    if (n < 0) throw herr("invalid base64");
-
-    size_t padding = clean.ends_with("==") ? 2 : clean.ends_with("=") ? 1 : 0;
-    output.resize((size_t)n - padding);
-
-    return output;
-}
-
 static secp256k1_context *secpCtx() {
     static secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
     return ctx;
@@ -84,7 +66,9 @@ static secp256k1_context *secpCtx() {
 Bytes32 verifyNip98(std::string_view authorization, std::string_view method, std::string_view expectedHost, std::string_view path, std::string_view body) {
     if (!authorization.starts_with("Nostr ")) throw herr("missing NIP-98 Authorization header");
 
-    auto evJson = tao::json::from_string(base64Decode(authorization.substr(6)));
+    auto encoded = authorization.substr(6);
+    while (encoded.size() && isspace((unsigned char)encoded.back())) encoded.remove_suffix(1);
+    auto evJson = tao::json::from_string(base64Decode(encoded));
 
     std::string packedStr, jsonStr;
     parseAndVerifyEvent(evJson, secpCtx(), true, false, packedStr, jsonStr);
@@ -203,6 +187,10 @@ static void addProfile(lmdb::txn &txn, Decompressor &decomp, tao::json::value &i
 tao::json::value tenantDetailJson(const TenantView &tenant) {
     auto output = tenantSummaryJson(tenant);
     output["settings"] = tenant.settings.toJson();
+    output["muted"] = tao::json::value({
+        { "fromMuteList", tenant.muted ? tenant.muted->fromMuteList : 0 },
+        { "hiddenEvents", tenant.muted ? tenant.muted->events.size() : 0 },
+    });
 
     auto txn = env.txn_ro();
     Decompressor decomp;
@@ -226,6 +214,7 @@ tao::json::value tenantDetailJson(const TenantView &tenant) {
     }
 
     output["members"] = std::move(members);
+    output["signer"] = signerJson(txn, tenant.id);
 
     return output;
 }
@@ -260,6 +249,8 @@ static void checkOwnerPatch(const tao::json::value &patch) {
             throw herr("secondaryPerPeer can be at most ", cfg().banyan__owners__maxSecondaryPerPeer);
         } else if (k == "pinned" && v.is_array() && v.get_array().size() > cfg().banyan__owners__maxPinned) {
             throw herr("at most ", cfg().banyan__owners__maxPinned, " people can be pinned");
+        } else if (k == "mutedThreads" && v.is_array() && v.get_array().size() > cfg().banyan__owners__maxMutedThreads) {
+            throw herr("at most ", cfg().banyan__owners__maxMutedThreads, " threads can be muted");
         }
     }
 }
@@ -269,6 +260,7 @@ static tao::json::value ownerLimitsJson() {
         { "primaryCircleSize", cfg().banyan__owners__maxPrimaryCircleSize },
         { "secondaryPerPeer", cfg().banyan__owners__maxSecondaryPerPeer },
         { "pinned", cfg().banyan__owners__maxPinned },
+        { "mutedThreads", cfg().banyan__owners__maxMutedThreads },
     });
 }
 
@@ -290,12 +282,12 @@ static TenantPtr lookupTenant(const std::string &slugOrPubkey) {
 
 static bool patchAffectsTrust(const tao::json::value &patch) {
     for (const auto &[k, v] : patch.get_object()) {
-        if (k != "slug") return true;
+        if (k != "slug" && k != "mutedThreads") return true;
     }
     return false;
 }
 
-static const std::vector<std::string> ownerMethods = { "supportedmethods", "whoami", "listtenants", "gettenant", "updatetenant", "recomputetrust" };
+static const std::vector<std::string> ownerMethods = { "supportedmethods", "whoami", "listtenants", "gettenant", "updatetenant", "recomputetrust", "connectsigner", "nostrconnect", "removesigner" };
 
 static tao::json::value dispatchRpc(const std::string &method, const tao::json::value &params, const Bytes32 &signer, bool admin) {
     auto param = [&](size_t i) -> const tao::json::value & {
@@ -321,7 +313,7 @@ static tao::json::value dispatchRpc(const std::string &method, const tao::json::
             for (const auto &m : ownerMethods) output.emplace_back(m);
             return output;
         }
-        return tao::json::value::array({ "supportedmethods", "whoami", "listtenants", "addtenant", "removetenant", "gettenant", "updatetenant", "recomputetrust", "harveststatus" });
+        return tao::json::value::array({ "supportedmethods", "whoami", "listtenants", "addtenant", "removetenant", "gettenant", "updatetenant", "recomputetrust", "connectsigner", "nostrconnect", "removesigner", "harveststatus" });
     } else if (method == "whoami") {
         auto own = ownTenant(signer);
         tao::json::value output = tao::json::value({
@@ -395,6 +387,22 @@ static tao::json::value dispatchRpc(const std::string &method, const tao::json::
     } else if (method == "recomputetrust") {
         requestRecompute(targetTenant(0)->id);
         return true;
+    } else if (method == "connectsigner" || method == "nostrconnect" || method == "removesigner") {
+        auto t = targetTenant(0);
+        if (method != "removesigner" && !cfg().banyan__signer__enabled) throw herr("remote signers are disabled on this server");
+
+        {
+            auto txn = env.txn_rw();
+            if (method == "connectsigner") setBunkerSigner(txn, t->id, parseBunkerUrl(strParam(1)));
+            else if (method == "nostrconnect") startNostrConnect(txn, t->id);
+            else removeSigner(txn, t->id);
+            txn.commit();
+        }
+
+        signersChanged();
+
+        auto txn = env.txn_ro();
+        return signerJson(txn, t->id);
     } else if (method == "harveststatus") {
         return harvesterStatus();
     }

@@ -79,6 +79,7 @@ struct MsgWriter : NonCopyable {
         std::string packedStr;
         std::string jsonStr;
         Bytes32 authed;
+        uint64_t tenantId = 0;
     };
 
     struct CloseConn {
@@ -208,6 +209,7 @@ struct RelayServer {
     std::thread banyanTrustThread;
     std::thread banyanHarvesterThread;
     std::thread banyanPruneThread;
+    std::thread banyanZapThread;
 
     void run();
 

@@ -1,10 +1,12 @@
-# strfry - a nostr relay
+# ficus-relay
 
 ![strfry logo](docs/strfry.svg)
 
-**This fork runs as a Banyan relay**: an admin adds people, and each one gets a virtual relay at `wss://host/<name>` filled with the notes of their trust circles. See [docs/banyan.md](docs/banyan.md).
+ficus-relay is a fork of [strfry](https://github.com/hoytech/strfry) that runs as a Banyan relay: an admin adds people, and each one gets a virtual relay at `wss://host/<name>` filled with the notes of their trust circles. See [docs/banyan.md](docs/banyan.md) for how it works and how to set it up, and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) to run it on a server.
 
-strfry is a relay for the [nostr protocol](https://github.com/nostr-protocol/nostr)
+The Docker image is published as `ghcr.io/nogringo/ficus-relay:latest`, see [sample-docker-compose.yaml](sample-docker-compose.yaml).
+
+The rest of this README is strfry's, and still applies: strfry is a relay for the [nostr protocol](https://github.com/nostr-protocol/nostr)
 
 * Supports most applicable NIPs: 1, 2, 4, 9, 11, 28, 40, 42, 45, 70, 77
 * No external database required: All data is stored locally on the filesystem in LMDB
@@ -59,16 +61,16 @@ A C++20 compiler is required, along with a few other common dependencies.
 
 On Debian/Ubuntu use these commands:
 
-    sudo apt install -y git g++ make libssl-dev zlib1g-dev liblmdb-dev libflatbuffers-dev libsecp256k1-dev libzstd-dev
-    git clone https://github.com/hoytech/strfry && cd strfry/
+    sudo apt install -y git g++ make libssl-dev zlib1g-dev liblmdb-dev libflatbuffers-dev libsecp256k1-dev libzstd-dev libcurl4-openssl-dev
+    git clone https://github.com/nogringo/ficus-relay && cd ficus-relay/
     git submodule update --init
     make setup-golpe
     make -j4
 
 FreeBSD has slightly different commands (warning: possibly out of date):
 
-    pkg install -y gmake git perl5 openssl lmdb flatbuffers libuv secp256k1 zstd
-    git clone https://github.com/hoytech/strfry && cd strfry/
+    pkg install -y gmake git perl5 openssl lmdb flatbuffers libuv secp256k1 zstd curl
+    git clone https://github.com/nogringo/ficus-relay && cd ficus-relay/
     git submodule update --init
     gmake setup-golpe
     gmake -j4
@@ -76,7 +78,7 @@ FreeBSD has slightly different commands (warning: possibly out of date):
 macOS commands (using Homebrew):
 
     brew install pkg-config libtool openssl zlib lmdb flatbuffers secp256k1 zstd libuv perl
-    git clone https://github.com/hoytech/strfry && cd strfry/
+    git clone https://github.com/nogringo/ficus-relay && cd ficus-relay/
     git submodule update --init
     make setup-golpe
     make -j4

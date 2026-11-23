@@ -24,10 +24,16 @@ config:
   - name: banyan__owners__maxPinned
     desc: "Maximum number of people a person can pin on their own relay"
     default: 200
+  - name: banyan__owners__maxMutedThreads
+    desc: "Maximum number of threads a person can mute on their own relay"
+    default: 500
 
   - name: banyan__threads__maxEvents
     desc: "Maximum number of events a thread filter ({\"thread\": [id]}) follows, root included (0 disables thread filters)"
     default: 10000
+  - name: banyan__threads__maxMutedEvents
+    desc: "Maximum number of events one person's muted threads hide, roots included"
+    default: 100000
 
   - name: banyan__prune__enabled
     desc: "Regularly delete events that no virtual relay serves and the trust engine does not read"
@@ -69,6 +75,12 @@ config:
   - name: banyan__trust__weightMention
     desc: "Default weight of a mention or quote"
     default: 1
+  - name: banyan__trust__zapReferenceSats
+    desc: "A zap of this many sats counts once, and about once more each time the amount doubles (0 counts every zap once)"
+    default: 100
+  - name: banyan__trust__verifyZapReceipts
+    desc: "Only count zap receipts signed by the nostrPubkey of the recipient's LNURL server, found through the lud16 or lud06 of their profile"
+    default: true
 
   - name: banyan__harvester__enabled
     desc: "Fetch the universe's events from other relays"
@@ -104,12 +116,22 @@ config:
     desc: "Answer NIP-42 AUTH challenges from other relays, with a key generated and stored in the database"
     default: true
   - name: banyan__harvester__allowPrivateAddresses
-    desc: "Let the harvester connect to relays on private, loopback or link-local addresses (tests and private networks)"
+    desc: "Let the harvester connect to relays, and zap verification to LNURL servers, on private, loopback or link-local addresses, LNURL over plain http included (tests and private networks)"
     default: false
 
   - name: banyan__distributor__enabled
     desc: "Send the events of a universe to the inbox relays (NIP-65 read relays) of the universe members they mention"
     default: true
   - name: banyan__distributor__maxAgeSeconds
-    desc: "Only events newer than this are sent to inbox relays"
+    desc: "Only events newer than this are sent to inbox and outbox relays"
     default: 86400
+  - name: banyan__distributor__publishToOutbox
+    desc: "Send what people of a universe publish on a virtual relay to their own write relays (NIP-65)"
+    default: true
+
+  - name: banyan__signer__enabled
+    desc: "Let people connect a NIP-46 remote signer, so the harvester can AUTH as them on relays that only serve them their own data"
+    default: true
+  - name: banyan__signer__relays
+    desc: "Comma-separated relays offered to remote signers in nostrconnect:// links"
+    default: "wss://promenade.fiatjaf.com, wss://relay.ditto.pub, wss://relay.primal.net"

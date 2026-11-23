@@ -8,6 +8,7 @@
 #include "apps/banyan/TrustEngine.h"
 #include "apps/banyan/Harvester.h"
 #include "apps/banyan/Pruner.h"
+#include "apps/banyan/Zaps.h"
 
 
 static const char USAGE[] =
@@ -109,6 +110,10 @@ void RelayServer::run() {
 
         banyanPruneThread = std::thread([]{
             banyan::runPruner();
+        });
+
+        banyanZapThread = std::thread([]{
+            banyan::runZapResolver();
         });
 
         if (cfg().banyan__harvester__enabled) {

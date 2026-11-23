@@ -1,28 +1,18 @@
 #include <atomic>
 #include <condition_variable>
-#include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <thread>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-#include <openssl/rand.h>
-#include <secp256k1.h>
-#include <secp256k1_extrakeys.h>
-#include <secp256k1_schnorrsig.h>
 #include <hoytech/time.h>
 #include <hoytech/hex.h>
-#include <uWebSockets/src/uWS.h>
 
 #include "Harvester.h"
+#include "Net.h"
+#include "PinnedHub.h"
+#include "Crypto.h"
+#include "RemoteSigner.h"
 #include "TrustEngine.h"
 #include "Tenants.h"
 #include "WriterPipeline.h"
@@ -44,6 +34,7 @@ static const uint64_t maxFiltersPerLiveReq = 10;
 static const uint64_t maxFutureSeconds = 900;
 
 static const uint64_t authTimeoutSeconds = 30;
+static const uint64_t ownerAuthTimeoutSeconds = 120;
 static const uint64_t maxDeliveryOnlyRelays = 20;
 static const uint64_t maxOutboxPerRelay = 1000;
 static const uint64_t maxInflightDeliveries = 20;
@@ -53,8 +44,17 @@ static const uint64_t maxEventsDistributedPerTick = 2000;
 static const uint64_t seenOnSeconds = 600;
 static const size_t maxSeenOn = 200'000;
 
+static const size_t maxOwnerRelays = 8;
+static const size_t maxOutboxRelaysPerAuthor = 8;
+static const size_t maxPublishQueue = 10'000;
+static const uint64_t wantedProfileSeconds = 600;
+static const size_t maxWantedProfiles = 5000;
+// NIP-59 gift wraps are dated up to two days in the past
+static const uint64_t giftWrapJitterSeconds = 2 * 86400 + 3600;
+
 
 static std::atomic<bool> wakeRequested = true;
+static std::atomic<bool> running = false;
 static std::mutex statusMutex;
 static tao::json::value statusJson = tao::json::value({ { "targets", 0 }, { "relays", tao::json::empty_array }, { "authPubkey", tao::json::null } });
 
@@ -68,43 +68,41 @@ tao::json::value harvesterStatus() {
 }
 
 
-static bool isPrivateIpv4(uint32_t addr) {
-    auto in = [&](uint32_t net, int bits){ return (addr >> (32 - bits)) == (net >> (32 - bits)); };
+static std::mutex wantedMutex;
+static flat_hash_map<Bytes32, uint64_t> wantedProfiles;
 
-    return in(0x00000000, 8) || in(0x0A000000, 8) || in(0x64400000, 10) || in(0x7F000000, 8) || in(0xA9FE0000, 16)
-        || in(0xAC100000, 12) || in(0xC0000000, 24) || in(0xC0A80000, 16) || in(0xC6120000, 15) || addr >= 0xE0000000;
+void harvesterWantProfiles(const std::vector<Bytes32> &pubkeys) {
+    {
+        std::lock_guard<std::mutex> guard(wantedMutex);
+        uint64_t now = hoytech::curr_time_s();
+        for (const auto &pk : pubkeys) {
+            if (wantedProfiles.size() >= maxWantedProfiles && !wantedProfiles.contains(pk)) break;
+            wantedProfiles[pk] = now;
+        }
+    }
+    wakeRequested = true;
 }
 
-static bool isPrivateAddress(const sockaddr *sa) {
-    if (sa->sa_family == AF_INET) return isPrivateIpv4(ntohl(((const sockaddr_in *)sa)->sin_addr.s_addr));
-    if (sa->sa_family != AF_INET6) return true;
 
-    const uint8_t *b = ((const sockaddr_in6 *)sa)->sin6_addr.s6_addr;
-    static const uint8_t v4MappedPrefix[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF };
-    static const uint8_t zeros[15] = {};
+struct Published {
+    uint64_t tenantId;
+    std::string packedStr;
+    std::string jsonStr;
+};
 
-    if (memcmp(b, v4MappedPrefix, 12) == 0) return isPrivateIpv4(uint32_t(b[12]) << 24 | uint32_t(b[13]) << 16 | uint32_t(b[14]) << 8 | b[15]);
-    if (memcmp(b, zeros, 15) == 0 && b[15] <= 1) return true;
+static std::mutex publishMutex;
+static std::deque<Published> publishQueue;
 
-    return (b[0] & 0xFE) == 0xFC || (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) || b[0] == 0xFF;
+void harvesterPublish(uint64_t tenantId, std::string packedStr, std::string jsonStr) {
+    if (!running || !cfg().banyan__distributor__enabled || !cfg().banyan__distributor__publishToOutbox) return;
+
+    std::lock_guard<std::mutex> guard(publishMutex);
+    if (publishQueue.size() >= maxPublishQueue) publishQueue.pop_front();
+    publishQueue.push_back(Published{ tenantId, std::move(packedStr), std::move(jsonStr) });
 }
 
-// Literal addresses and local names only: hostnames are checked again once resolved, in probeTcp()
-static bool isPrivateHost(std::string_view host) {
-    if (auto pos = host.rfind(':'); pos != std::string_view::npos && host.find(']') == std::string_view::npos) host = host.substr(0, pos);
-    if (host.ends_with('.')) host.remove_suffix(1);
 
-    if (host.empty() || host.starts_with("[")) return true;
-    if (host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") || host.ends_with(".internal") || host.ends_with(".onion")) return true;
-
-    in_addr addr;
-    if (inet_pton(AF_INET, std::string(host).c_str(), &addr) == 1) return isPrivateIpv4(ntohl(addr.s_addr));
-
-    return false;
-}
-
-// Returns an empty string for URLs the harvester should not use
-static std::string normalizeHarvestUrl(std::string_view input) {
+std::string normalizeHarvestUrl(std::string_view input) {
     std::string url(input);
     while (url.size() && isspace((unsigned char)url.back())) url.pop_back();
     while (url.size() && isspace((unsigned char)url.front())) url.erase(url.begin());
@@ -151,90 +149,49 @@ static tao::json::value hexArray(const std::vector<Bytes32> &pks) {
 
 // uWS resolves DNS and, on macOS, connects with blocking calls inside its event loop, so one dead
 // relay would freeze the harvester. Hosts are checked here first, on worker threads.
-enum class ProbeResult { Reachable, Unreachable, PrivateAddress };
-
-static ProbeResult probeTcp(const std::string &url, int timeoutMs) {
-    auto parts = parseRelayUrl(url);
-    std::string host = parts.host;
-    std::string port = url.starts_with("wss://") ? "443" : "80";
-
-    if (auto colon = host.rfind(':'); colon != std::string::npos) {
-        port = host.substr(colon + 1);
-        host = host.substr(0, colon);
-    }
-
-    addrinfo hints{}, *result = nullptr;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &result) != 0) return ProbeResult::Unreachable;
-
-    // Same address uWS will use: the first one
-    if (!cfg().banyan__harvester__allowPrivateAddresses && isPrivateAddress(result->ai_addr)) {
-        freeaddrinfo(result);
-        return ProbeResult::PrivateAddress;
-    }
-
-    bool ok = false;
-    int fd = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-
-    if (fd >= 0) {
-        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-
-        if (::connect(fd, result->ai_addr, result->ai_addrlen) == 0) {
-            ok = true;
-        } else if (errno == EINPROGRESS) {
-            pollfd p{ fd, POLLOUT, 0 };
-            if (poll(&p, 1, timeoutMs) == 1) {
-                int err = 0;
-                socklen_t len = sizeof(err);
-                ok = getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0;
-            }
-        }
-
-        close(fd);
-    }
-
-    freeaddrinfo(result);
-    return ok ? ProbeResult::Reachable : ProbeResult::Unreachable;
-}
-
 struct Prober {
+    struct Result {
+        std::string key;
+        ProbeOutcome outcome;
+    };
+
     std::mutex mutex;
     std::condition_variable cv;
-    std::deque<std::string> pending;
-    std::vector<std::pair<std::string, ProbeResult>> results;
+    std::deque<std::pair<std::string, std::string>> pending; // key, url
+    std::vector<Result> results;
 
     Prober(size_t numWorkers) {
         for (size_t i = 0; i < numWorkers; i++) {
             std::thread([this]{
                 setThreadName("BanyanProbe");
                 while (1) {
-                    std::string url;
+                    std::pair<std::string, std::string> job;
                     {
                         std::unique_lock<std::mutex> lk(mutex);
                         cv.wait(lk, [&]{ return pending.size() > 0; });
-                        url = std::move(pending.front());
+                        job = std::move(pending.front());
                         pending.pop_front();
                     }
 
-                    auto result = probeTcp(url, 5'000);
+                    auto hp = splitHostPort(parseRelayUrl(job.second).host, job.second.starts_with("wss://"));
+                    auto outcome = probeTcp(hp.host, hp.port, 5'000, cfg().banyan__harvester__allowPrivateAddresses);
 
                     std::lock_guard<std::mutex> guard(mutex);
-                    results.emplace_back(url, result);
+                    results.push_back(Result{ std::move(job.first), std::move(outcome) });
                 }
             }).detach();
         }
     }
 
-    void submit(const std::string &url) {
+    void submit(const std::string &key, const std::string &url) {
         {
             std::lock_guard<std::mutex> guard(mutex);
-            pending.push_back(url);
+            pending.emplace_back(key, url);
         }
         cv.notify_one();
     }
 
-    std::vector<std::pair<std::string, ProbeResult>> takeResults() {
+    std::vector<Result> takeResults() {
         std::lock_guard<std::mutex> guard(mutex);
         return std::move(results);
     }
@@ -242,76 +199,35 @@ struct Prober {
 
 
 // Signs NIP-42 AUTH events. Stored in the database so other relays always see the same pubkey.
-struct UpstreamKey {
-    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    secp256k1_keypair keypair;
-    std::string pubkey;
-
-    UpstreamKey() {
-        std::string sk = loadOrCreate();
-        if (!secp256k1_keypair_create(ctx, &keypair, (const uint8_t*)sk.data())) throw herr("invalid harvester key");
-
-        secp256k1_xonly_pubkey xonly;
-        secp256k1_keypair_xonly_pub(ctx, &xonly, nullptr, &keypair);
-        pubkey.resize(32);
-        secp256k1_xonly_pubkey_serialize(ctx, (uint8_t*)pubkey.data(), &xonly);
-    }
-
-    std::string loadOrCreate() {
-        {
-            auto txn = env.txn_ro();
-            std::string found;
-            env.foreach_HarvesterKey(txn, [&](auto &view){
-                found = std::string(view.secretKey());
-                return false;
-            });
-            if (found.size() == 32 && secp256k1_ec_seckey_verify(ctx, (const uint8_t*)found.data())) return found;
-        }
-
-        std::string sk(32, '\0');
-        do {
-            if (RAND_bytes((uint8_t*)sk.data(), 32) != 1) throw herr("unable to generate the harvester key");
-        } while (!secp256k1_ec_seckey_verify(ctx, (const uint8_t*)sk.data()));
-
-        auto txn = env.txn_rw();
-        std::vector<uint64_t> old;
+static KeyPair loadOrCreateHarvesterKey() {
+    {
+        auto txn = env.txn_ro();
+        std::string found;
         env.foreach_HarvesterKey(txn, [&](auto &view){
-            old.push_back(view.primaryKeyId);
-            return true;
-        });
-        for (auto id : old) env.delete_HarvesterKey(txn, id);
-        env.insert_HarvesterKey(txn, sk);
-        txn.commit();
-
-        return sk;
-    }
-
-    tao::json::value sign(uint64_t kind, tao::json::value tags, std::string content) {
-        tao::json::value ev = tao::json::value({
-            { "pubkey", to_hex(pubkey) },
-            { "created_at", hoytech::curr_time_s() },
-            { "kind", kind },
-            { "tags", std::move(tags) },
-            { "content", std::move(content) },
+            found = std::string(view.secretKey());
+            return false;
         });
 
-        auto id = nostrHash(ev);
-
-        uint8_t aux[32], sig[64];
-        if (RAND_bytes(aux, sizeof(aux)) != 1) throw herr("unable to get randomness");
-
-#ifdef SECP256K1_SCHNORRSIG_EXTRAPARAMS_INIT
-        bool ok = secp256k1_schnorrsig_sign32(ctx, sig, (const uint8_t*)id.sv().data(), &keypair, aux);
-#else
-        bool ok = secp256k1_schnorrsig_sign(ctx, sig, (const uint8_t*)id.sv().data(), &keypair, aux);
-#endif
-        if (!ok) throw herr("signing failed");
-
-        ev["id"] = to_hex(id.sv());
-        ev["sig"] = to_hex(std::string_view((const char*)sig, sizeof(sig)));
-        return ev;
+        try {
+            if (found.size() == 32) return KeyPair::fromSecret(found);
+        } catch (std::exception &) {
+        }
     }
-};
+
+    auto key = KeyPair::generate();
+
+    auto txn = env.txn_rw();
+    std::vector<uint64_t> old;
+    env.foreach_HarvesterKey(txn, [&](auto &view){
+        old.push_back(view.primaryKeyId);
+        return true;
+    });
+    for (auto id : old) env.delete_HarvesterKey(txn, id);
+    env.insert_HarvesterKey(txn, key.secretKey);
+    txn.commit();
+
+    return key;
+}
 
 
 struct RelayList {
@@ -352,18 +268,47 @@ static RelayList loadRelayList(lmdb::txn &txn, Decompressor &decomp, const Bytes
     return output;
 }
 
+// NIP-17: where someone receives their gift wraps (kind 10050)
+static std::vector<std::string> loadDmRelays(lmdb::txn &txn, Decompressor &decomp, const Bytes32 &pk, const std::function<bool(const std::string &)> &allowed) {
+    std::vector<std::string> output;
+
+    tao::json::value filter = tao::json::value({
+        { "authors", tao::json::value::array({ to_hex(pk.sv()) }) },
+        { "kinds", tao::json::value::array({ uint64_t(10050) }) },
+        { "limit", uint64_t(1) },
+    });
+
+    foreachByFilter(txn, filter, [&](uint64_t levId){
+        try {
+            auto ev = tao::json::from_string(getEventJson(txn, decomp, levId));
+
+            for (const auto &tagj : ev.at("tags").get_array()) {
+                const auto &tag = tagj.get_array();
+                if (tag.size() < 2 || tag[0].get_string() != "relay") continue;
+
+                auto url = normalizeHarvestUrl(tag[1].get_string());
+                if (url.size() && allowed(url) && std::find(output.begin(), output.end(), url) == output.end()) output.push_back(url);
+            }
+        } catch (std::exception &) {
+        }
+    });
+
+    return output;
+}
+
 
 struct Assignment {
-    std::vector<Bytes32> authors; // fetch what they publish
-    std::vector<Bytes32> inbox;   // fetch what mentions or zaps them (trust evidence for seeds)
-    std::vector<Bytes32> meta;    // fetch their profile and relay list (bootstrap relays only)
+    std::vector<Bytes32> authors;   // fetch what they publish
+    std::vector<Bytes32> inbox;     // fetch what mentions or zaps them (trust evidence for seeds)
+    std::vector<Bytes32> giftWraps; // fetch their gift wraps (owner sessions, authenticated as them)
+    std::vector<Bytes32> meta;      // fetch their profile and relay list (bootstrap relays only)
 
     bool operator==(const Assignment &o) const {
-        return authors == o.authors && inbox == o.inbox && meta == o.meta;
+        return authors == o.authors && inbox == o.inbox && giftWraps == o.giftWraps && meta == o.meta;
     }
 };
 
-enum class Scope { Authors, Inbox, ZapsSent, Meta };
+enum class Scope { Authors, Inbox, ZapsSent, GiftWraps, Meta };
 
 struct ReqSpec {
     Scope scope;
@@ -387,6 +332,9 @@ static tao::json::value buildFilter(const ReqSpec &r) {
     } else if (r.scope == Scope::ZapsSent) {
         f["#P"] = hexArray(r.pubkeys);
         f["kinds"] = tao::json::value::array({ uint64_t(9735) });
+    } else if (r.scope == Scope::GiftWraps) {
+        f["#p"] = hexArray(r.pubkeys);
+        f["kinds"] = tao::json::value::array({ uint64_t(1059) });
     } else {
         f["authors"] = hexArray(r.pubkeys);
         f["kinds"] = tao::json::value::array({ uint64_t(0), uint64_t(10002) });
@@ -409,12 +357,13 @@ struct ActiveReq {
     uint64_t startedAt = 0;
 };
 
-enum class AuthState { None, Wanted, Sent, Ok, Failed };
+enum class AuthState { None, Wanted, Signing, Sent, Ok, Failed };
 
 static std::string_view authStateName(AuthState s) {
     switch (s) {
         case AuthState::None: return "none";
         case AuthState::Wanted: return "wanted";
+        case AuthState::Signing: return "signing";
         case AuthState::Sent: return "sent";
         case AuthState::Ok: return "ok";
         case AuthState::Failed: return "failed";
@@ -427,10 +376,29 @@ struct Delivery {
     std::string json;
     uint64_t createdAt = 0;
     uint64_t sentAt = 0;
+    bool outbox = false; // to the author's own write relay, rather than the inbox of someone mentioned
 };
 
+// Harvest: shared by every universe. Owner: authenticated as one owner, through their remote signer. Signer: NIP-46 messages.
+enum class Role { Harvest, Owner, Signer };
+
+static std::string_view roleName(Role r) {
+    switch (r) {
+        case Role::Harvest: return "harvest";
+        case Role::Owner: return "owner";
+        case Role::Signer: return "signer";
+    }
+    return "?";
+}
+
 struct Relay {
+    std::string key; // url, url#ownerhex or nip46|url
     std::string url;
+    Role role = Role::Harvest;
+    uint64_t tenantId = 0;
+    Bytes32 authAs;
+    std::string signerReq;
+
     uWS::WebSocket<uWS::CLIENT> *ws = nullptr;
     bool probing = false;
     bool connecting = false;
@@ -439,7 +407,7 @@ struct Relay {
     uint64_t failures = 0;
 
     Assignment assignment;
-    flat_hash_set<Bytes32> backfilledAuthors, backfilledInbox, metaDone;
+    flat_hash_set<Bytes32> backfilledAuthors, backfilledInbox, backfilledGiftWraps, metaDone;
 
     std::deque<ReqSpec> queue;
     std::map<std::string, ActiveReq> active;
@@ -456,7 +424,7 @@ struct Relay {
     std::vector<ReqSpec> authRetry;
     bool authRetryLive = false;
 
-    // Events sent to this relay because it is an inbox of someone they mention
+    // Events sent to this relay: inbox of someone they mention, or outbox of their author
     std::deque<Delivery> outbox;
     flat_hash_map<std::string, Delivery> inflight;
     flat_hash_set<std::string> deliveryIds;
@@ -469,7 +437,7 @@ struct Relay {
     }
 
     bool deliveryOnly() const {
-        return assignment == Assignment{};
+        return role == Role::Harvest && assignment == Assignment{};
     }
 
     void resetSession() {
@@ -486,31 +454,43 @@ struct Relay {
     }
 };
 
+struct PlanEntry {
+    std::string url;
+    Role role = Role::Harvest;
+    uint64_t tenantId = 0;
+    Bytes32 authAs;
+    Assignment assignment;
+    std::string signerReq;
+};
+
 
 struct Harvester {
-    uWS::Hub hub;
+    PinnedHub hub;
     uWS::Group<uWS::CLIENT> *group = nullptr;
     uS::Async *trigger = nullptr;
     WriterPipeline writer;
     Prober prober{8};
+    RemoteSigners signers;
 
     std::map<std::string, Relay> relays;
     flat_hash_map<Bytes32, bool> targets; // pubkey -> is seed
     uint64_t lastPlanAt = 0;
-    uint64_t lastSnapshotVersion = 0;
+    uint64_t lastUniverseVersion = 0;
 
-    std::optional<UpstreamKey> key;
+    std::optional<KeyPair> key;
 
-    // Distribution: the inbox relays of each universe member, and where harvested events already are
+    // Distribution: the inbox and outbox relays of each universe member, and where harvested events already are
     struct SeenOn {
         uint64_t at = 0;
         std::vector<std::string> urls;
     };
 
     flat_hash_map<Bytes32, std::vector<std::string>> deliveryRelays;
+    flat_hash_map<Bytes32, std::vector<std::string>> outboxRelays;
     flat_hash_map<Bytes32, SeenOn> seenOn;
     std::optional<uint64_t> distributedUpTo;
     uint64_t deliveredTotal = 0;
+    uint64_t publishedTotal = 0;
     uint64_t lastHousekeepingAt = 0;
     Decompressor decomp;
 
@@ -520,17 +500,30 @@ struct Harvester {
         writer.verboseCommit = []{ return false; };
 
         try {
-            key.emplace();
+            key = loadOrCreateHarvesterKey();
             LI << "Banyan harvester: NIP-42 AUTH as " << toNpub(Bytes32(key->pubkey));
         } catch (std::exception &e) {
             LE << "Banyan harvester: no key for NIP-42 AUTH: " << e.what();
         }
 
+        signers.sendToRelay = [this](const std::string &url, const std::string &msg){
+            auto it = relays.find(signerKey(url));
+            if (it == relays.end() || !it->second.ws) return false;
+            it->second.ws->send(msg.data(), msg.size(), uWS::OpCode::TEXT);
+            return true;
+        };
+
+        try {
+            signers.load();
+        } catch (std::exception &e) {
+            LE << "Banyan harvester: unable to load remote signers: " << e.what();
+        }
+
         group = hub.createGroup<uWS::CLIENT>(uWS::PERMESSAGE_DEFLATE | uWS::SLIDING_DEFLATE_WINDOW);
 
         group->onConnection([&](uWS::WebSocket<uWS::CLIENT> *ws, uWS::HttpRequest){
-            auto *url = (std::string*)ws->getUserData();
-            auto it = relays.find(*url);
+            auto *key = (std::string*)ws->getUserData();
+            auto it = relays.find(*key);
 
             if (it == relays.end()) {
                 ws->close();
@@ -541,14 +534,16 @@ struct Harvester {
             r.ws = ws;
             r.connecting = false;
             r.connectedAt = hoytech::curr_time_s();
-            LI << "Banyan harvester: connected to " << r.url;
-            startSession(r);
+            LI << "Banyan harvester: connected to " << r.url << (r.role == Role::Harvest ? "" : std::string(" (") + std::string(roleName(r.role)) + ")");
+
+            if (r.role == Role::Signer) sendRaw(r, r.signerReq);
+            else startSession(r);
         });
 
         group->onDisconnection([&](uWS::WebSocket<uWS::CLIENT> *ws, int code, char *message, size_t length){
-            auto *url = (std::string*)ws->getUserData();
+            auto *key = (std::string*)ws->getUserData();
 
-            if (auto it = relays.find(*url); it != relays.end() && it->second.ws == ws) {
+            if (auto it = relays.find(*key); it != relays.end() && it->second.ws == ws) {
                 auto &r = it->second;
                 uint64_t now = hoytech::curr_time_s();
                 if (now < r.connectedAt + 60) r.failures++;
@@ -559,13 +554,13 @@ struct Harvester {
                 LI << "Banyan harvester: disconnected from " << r.url << " (" << code << ")";
             }
 
-            delete url;
+            delete key;
         });
 
         group->onError([&](void *userData){
-            auto *url = (std::string*)userData;
+            auto *key = (std::string*)userData;
 
-            if (auto it = relays.find(*url); it != relays.end()) {
+            if (auto it = relays.find(*key); it != relays.end()) {
                 auto &r = it->second;
                 r.connecting = false;
                 r.failures++;
@@ -574,22 +569,31 @@ struct Harvester {
                 r.nextAttemptAt = hoytech::curr_time_s() + backoffSeconds(r.failures);
             }
 
-            delete url;
+            delete key;
         });
 
         group->onMessage2([&](uWS::WebSocket<uWS::CLIENT> *ws, char *message, size_t length, uWS::OpCode, size_t){
-            auto *url = (std::string*)ws->getUserData();
-            auto it = relays.find(*url);
+            auto *key = (std::string*)ws->getUserData();
+            auto it = relays.find(*key);
             if (it == relays.end() || it->second.ws != ws) return;
 
             try {
-                handleMessage(it->second, std::string_view(message, length));
+                if (it->second.role == Role::Signer) handleSignerMessage(it->second, std::string_view(message, length));
+                else handleMessage(it->second, std::string_view(message, length));
             } catch (std::exception &e) {
                 it->second.lastError = std::string("bad message: ") + e.what();
             }
 
             writer.wait();
         });
+    }
+
+    static std::string signerKey(const std::string &url) {
+        return "nip46|" + url;
+    }
+
+    static std::string ownerKey(const std::string &url, const Bytes32 &owner) {
+        return url + "#" + to_hex(owner.sv());
     }
 
     static constexpr uint64_t maxBackoffSeconds = 1800;
@@ -605,6 +609,11 @@ struct Harvester {
         if (!r.ws) return;
         auto str = tao::json::to_string(msg);
         r.ws->send(str.data(), str.size(), uWS::OpCode::TEXT);
+    }
+
+    void sendRaw(Relay &r, const std::string &msg) {
+        if (!r.ws || msg.empty()) return;
+        r.ws->send(msg.data(), msg.size(), uWS::OpCode::TEXT);
     }
 
     void openReq(Relay &r, std::vector<ReqSpec> &&specs) {
@@ -667,6 +676,7 @@ struct Harvester {
         uint64_t now = hoytech::curr_time_s();
         uint64_t window = cfg().banyan__harvester__backfillDays * 86400;
         uint64_t defaultSince = now > window ? now - window : 0;
+        uint64_t margin = scope == Scope::GiftWraps ? giftWrapJitterSeconds : 3600;
 
         std::vector<std::pair<uint64_t, Bytes32>> bySince;
 
@@ -675,8 +685,8 @@ struct Harvester {
             for (const auto &pk : pks) {
                 uint64_t since = defaultSince;
                 if (auto st = env.lookup_HarvestState__pubkey(txn, pk.sv())) {
-                    uint64_t done = scope == Scope::Authors ? st->authoredBackfilledAt() : st->inboxBackfilledAt();
-                    if (done) since = std::max(defaultSince, done > 3600 ? done - 3600 : 0);
+                    uint64_t done = scope == Scope::Authors ? st->authoredBackfilledAt() : scope == Scope::GiftWraps ? st->giftWrapsBackfilledAt() : st->inboxBackfilledAt();
+                    if (done) since = std::max(defaultSince, done > margin ? done - margin : 0);
                 }
                 bySince.emplace_back(since, pk);
             }
@@ -714,7 +724,7 @@ struct Harvester {
                 ReqSpec spec;
                 spec.scope = scope;
                 spec.live = true;
-                spec.since = now;
+                spec.since = scope == Scope::GiftWraps ? now - giftWrapJitterSeconds : now;
                 spec.pubkeys = std::move(c);
                 specs.push_back(std::move(spec));
             }
@@ -723,6 +733,7 @@ struct Harvester {
         add(Scope::Authors, r.assignment.authors);
         add(Scope::Inbox, r.assignment.inbox);
         add(Scope::ZapsSent, r.assignment.inbox);
+        add(Scope::GiftWraps, r.assignment.giftWraps);
 
         for (size_t i = 0; i < specs.size(); i += maxFiltersPerLiveReq) {
             std::vector<ReqSpec> group(std::make_move_iterator(specs.begin() + i), std::make_move_iterator(specs.begin() + std::min<size_t>(specs.size(), i + maxFiltersPerLiveReq)));
@@ -731,11 +742,15 @@ struct Harvester {
     }
 
     void enqueueMissingWork(Relay &r) {
-        flat_hash_set<Bytes32> pendingMeta, pendingAuthors, pendingInbox;
+        flat_hash_set<Bytes32> pendingMeta, pendingAuthors, pendingInbox, pendingGiftWraps;
 
         auto collect = [&](const ReqSpec &spec){
             if (spec.live) return;
-            auto *set = spec.scope == Scope::Meta ? &pendingMeta : spec.scope == Scope::Authors ? &pendingAuthors : spec.scope == Scope::Inbox ? &pendingInbox : nullptr;
+            flat_hash_set<Bytes32> *set = nullptr;
+            if (spec.scope == Scope::Meta) set = &pendingMeta;
+            else if (spec.scope == Scope::Authors) set = &pendingAuthors;
+            else if (spec.scope == Scope::Inbox) set = &pendingInbox;
+            else if (spec.scope == Scope::GiftWraps) set = &pendingGiftWraps;
             if (set) set->insert(spec.pubkeys.begin(), spec.pubkeys.end());
         };
 
@@ -745,17 +760,15 @@ struct Harvester {
             for (const auto &spec : req.specs) collect(spec);
         }
 
-        std::vector<Bytes32> meta, authors, inbox;
+        auto missing = [](const std::vector<Bytes32> &assigned, const flat_hash_set<Bytes32> &done, const flat_hash_set<Bytes32> &pending){
+            std::vector<Bytes32> output;
+            for (const auto &pk : assigned) {
+                if (!done.contains(pk) && !pending.contains(pk)) output.push_back(pk);
+            }
+            return output;
+        };
 
-        for (const auto &pk : r.assignment.meta) {
-            if (!r.metaDone.contains(pk) && !pendingMeta.contains(pk)) meta.push_back(pk);
-        }
-        for (const auto &pk : r.assignment.authors) {
-            if (!r.backfilledAuthors.contains(pk) && !pendingAuthors.contains(pk)) authors.push_back(pk);
-        }
-        for (const auto &pk : r.assignment.inbox) {
-            if (!r.backfilledInbox.contains(pk) && !pendingInbox.contains(pk)) inbox.push_back(pk);
-        }
+        auto meta = missing(r.assignment.meta, r.metaDone, pendingMeta);
 
         // Relay lists first: they decide where everything else is fetched from
         for (auto &c : chunk(meta)) {
@@ -765,8 +778,9 @@ struct Harvester {
             r.queue.push_front(std::move(spec));
         }
 
-        enqueueBackfill(r, Scope::Authors, authors);
-        enqueueBackfill(r, Scope::Inbox, inbox);
+        enqueueBackfill(r, Scope::Authors, missing(r.assignment.authors, r.backfilledAuthors, pendingAuthors));
+        enqueueBackfill(r, Scope::Inbox, missing(r.assignment.inbox, r.backfilledInbox, pendingInbox));
+        enqueueBackfill(r, Scope::GiftWraps, missing(r.assignment.giftWraps, r.backfilledGiftWraps, pendingGiftWraps));
     }
 
     void startSession(Relay &r) {
@@ -794,12 +808,37 @@ struct Harvester {
     }
 
 
-    bool authEnabled() {
-        return key && cfg().banyan__harvester__auth;
+    bool authEnabled(const Relay &r) {
+        if (!cfg().banyan__harvester__auth) return false;
+        if (r.role == Role::Owner) return cfg().banyan__signer__enabled;
+        return key.has_value();
     }
 
     void sendAuth(Relay &r) {
-        if (!authEnabled() || r.authChallenge.empty() || !r.ws) return;
+        if (!authEnabled(r) || r.authChallenge.empty() || !r.ws) return;
+
+        if (r.role == Role::Owner) {
+            r.authState = AuthState::Signing;
+            r.authSentAt = hoytech::curr_time_s();
+
+            std::string relayKey = r.key, challenge = r.authChallenge;
+
+            signers.signAuth(r.tenantId, r.url, challenge, [this, relayKey, challenge](bool ok, const tao::json::value &ev, const std::string &error){
+                auto it = relays.find(relayKey);
+                if (it == relays.end()) return;
+                auto &r = it->second;
+                if (r.authState != AuthState::Signing || r.authChallenge != challenge || !r.ws) return;
+
+                if (!ok) return authDone(r, false, "remote signer: " + error);
+
+                r.authEventId = ev.at("id").get_string();
+                r.authState = AuthState::Sent;
+                r.authSentAt = hoytech::curr_time_s();
+                send(r, tao::json::value::array({ "AUTH", ev }));
+            });
+
+            return;
+        }
 
         tao::json::value ev;
 
@@ -821,7 +860,7 @@ struct Harvester {
 
     // The relay refused something until we authenticate. Returns false when AUTH can't help.
     bool deferUntilAuth(Relay &r) {
-        if (!authEnabled() || r.authState == AuthState::Ok || r.authState == AuthState::Failed) return false;
+        if (!authEnabled(r) || r.authState == AuthState::Ok || r.authState == AuthState::Failed) return false;
 
         if (r.authState == AuthState::None) {
             r.authState = AuthState::Wanted;
@@ -829,7 +868,7 @@ struct Harvester {
             sendAuth(r);
         }
 
-        return true;
+        return r.authState != AuthState::Failed;
     }
 
     void authDone(Relay &r, bool ok, const std::string &reason) {
@@ -846,7 +885,12 @@ struct Harvester {
         }
 
         r.authState = AuthState::Ok;
-        LI << "Banyan harvester: authenticated to " << r.url;
+        LI << "Banyan harvester: authenticated to " << r.url << (r.role == Role::Owner ? " as " + toNpub(r.authAs) : "");
+
+        if (r.role == Role::Signer) {
+            sendRaw(r, r.signerReq);
+            return;
+        }
 
         for (auto it = r.authRetry.rbegin(); it != r.authRetry.rend(); ++it) r.queue.push_front(std::move(*it));
         r.authRetry.clear();
@@ -863,7 +907,7 @@ struct Harvester {
 
 
     void pumpOutbox(Relay &r) {
-        if (!r.ws || r.authState == AuthState::Wanted || r.authState == AuthState::Sent) return;
+        if (!r.ws || r.authState == AuthState::Wanted || r.authState == AuthState::Signing || r.authState == AuthState::Sent) return;
 
         uint64_t now = hoytech::curr_time_s();
         uint64_t maxAge = cfg().banyan__distributor__maxAgeSeconds;
@@ -896,7 +940,8 @@ struct Harvester {
 
         if (ok || reason.starts_with("duplicate:")) {
             r.delivered++;
-            deliveredTotal++;
+            if (d.outbox) publishedTotal++;
+            else deliveredTotal++;
             r.deliveryIds.erase(d.id);
         } else if (reason.starts_with("auth-required:") && deferUntilAuth(r)) {
             r.outbox.push_front(std::move(d));
@@ -913,13 +958,15 @@ struct Harvester {
         return std::count_if(relays.begin(), relays.end(), [](const auto &p){ return p.second.deliveryOnly(); });
     }
 
-    void queueDelivery(const std::string &url, const std::string &id, const std::string &json, uint64_t createdAt, size_t &deliveryOnlyCount) {
-        auto it = relays.find(url);
+    // Only shared connections are opened on demand: owner sessions exist because the plan wants them
+    void queueDelivery(const std::string &relayKey, const std::string &url, const std::string &id, const std::string &json, uint64_t createdAt, bool outbox, size_t &deliveryOnlyCount) {
+        auto it = relays.find(relayKey);
 
         if (it == relays.end()) {
-            if (deliveryOnlyCount >= maxDeliveryOnlyRelays) return;
+            if (relayKey != url || deliveryOnlyCount >= maxDeliveryOnlyRelays) return;
             deliveryOnlyCount++;
             it = relays.try_emplace(url).first;
+            it->second.key = url;
             it->second.url = url;
         }
 
@@ -931,7 +978,7 @@ struct Harvester {
             r.outbox.pop_front();
         }
 
-        r.outbox.push_back(Delivery{ id, json, createdAt, 0 });
+        r.outbox.push_back(Delivery{ id, json, createdAt, 0, outbox });
         r.lastDeliveryAt = hoytech::curr_time_s();
         pumpOutbox(r);
     }
@@ -1000,12 +1047,59 @@ struct Harvester {
                 for (const auto &url : it->second) {
                     if (seen != seenOn.end() && std::find(seen->second.urls.begin(), seen->second.urls.end(), url) != seen->second.urls.end()) continue;
                     if (json.empty()) json = std::string(getEventJson(txn, decomp, ev.primaryKeyId));
-                    queueDelivery(url, id, json, packed.created_at(), deliveryOnlyCount);
+                    queueDelivery(url, url, id, json, packed.created_at(), false, deliveryOnlyCount);
                 }
             }
 
             return true;
         }, false, *distributedUpTo + 1);
+    }
+
+    // What clients publish on a virtual relay also reaches the author's own write relays, so the Banyan can be their only relay
+    void publishToOutboxes(uint64_t now) {
+        std::deque<Published> batch;
+        {
+            std::lock_guard<std::mutex> guard(publishMutex);
+            batch.swap(publishQueue);
+        }
+
+        if (batch.empty() || !cfg().banyan__distributor__enabled || !cfg().banyan__distributor__publishToOutbox) return;
+
+        auto snap = TenantRegistry::get();
+        uint64_t maxAge = cfg().banyan__distributor__maxAgeSeconds;
+        uint64_t minCreated = now > maxAge ? now - maxAge : 0;
+        size_t deliveryOnlyCount = numDeliveryOnlyRelays();
+
+        for (const auto &p : batch) {
+            auto t = snap->findById(p.tenantId);
+            if (!t) continue;
+
+            PackedEventView packed(p.packedStr);
+            uint64_t kind = packed.kind();
+
+            if (!t->inUniverse(packed.pubkey())) continue;
+            if (kind == 1059 || kind == 21059 || (kind >= 20000 && kind < 30000)) continue;
+            if (packed.created_at() < minCreated || packed.created_at() > now + maxFutureSeconds) continue;
+
+            // NIP-70: only the author may publish a protected event
+            bool isProtected = false;
+            packed.foreachTag([&](char tagName, std::string_view){
+                if (tagName == '-') isProtected = true;
+                return !isProtected;
+            });
+            if (isProtected) continue;
+
+            Bytes32 author(packed.pubkey());
+            auto it = outboxRelays.find(author);
+            if (it == outboxRelays.end()) continue;
+
+            std::string id = to_hex(packed.id());
+
+            for (const auto &url : it->second) {
+                auto key = ownerKey(url, author);
+                queueDelivery(relays.contains(key) ? key : url, url, id, p.jsonStr, packed.created_at(), true, deliveryOnlyCount);
+            }
+        }
     }
 
 
@@ -1018,10 +1112,11 @@ struct Harvester {
             if (st) {
                 defaultDb::environment::Updates_HarvestState upd;
                 if (scope == Scope::Authors) upd.authoredBackfilledAt = at;
+                else if (scope == Scope::GiftWraps) upd.giftWrapsBackfilledAt = at;
                 else upd.inboxBackfilledAt = at;
                 env.update_HarvestState(txn, *st, upd);
             } else {
-                env.insert_HarvestState(txn, pk.sv(), scope == Scope::Authors ? at : 0, scope == Scope::Authors ? 0 : at);
+                env.insert_HarvestState(txn, pk.sv(), scope == Scope::Authors ? at : 0, scope == Scope::Inbox ? at : 0, scope == Scope::GiftWraps ? at : 0);
             }
         }
 
@@ -1036,7 +1131,7 @@ struct Harvester {
         }
 
         if (spec.scope != Scope::ZapsSent) {
-            auto &done = spec.scope == Scope::Authors ? r.backfilledAuthors : r.backfilledInbox;
+            auto &done = spec.scope == Scope::Authors ? r.backfilledAuthors : spec.scope == Scope::GiftWraps ? r.backfilledGiftWraps : r.backfilledInbox;
             for (const auto &pk : spec.pubkeys) done.insert(pk);
 
             try {
@@ -1046,7 +1141,7 @@ struct Harvester {
             }
         }
 
-        notifyEngagementChanged(spec.pubkeys);
+        if (spec.scope != Scope::GiftWraps) notifyEngagementChanged(spec.pubkeys);
     }
 
     void handleMessage(Relay &r, std::string_view msg) {
@@ -1132,7 +1227,7 @@ struct Harvester {
         } else if (type == "AUTH") {
             if (!arr[1].is_string()) return;
             r.authChallenge = arr[1].get_string();
-            if (r.authState != AuthState::Failed && r.authState != AuthState::Sent) sendAuth(r);
+            if (r.authState != AuthState::Failed && r.authState != AuthState::Sent && r.authState != AuthState::Signing) sendAuth(r);
         } else if (type == "OK" && arr.size() >= 3 && arr[1].is_string()) {
             const auto &id = arr[1].get_string();
             bool ok = arr[2].is_boolean() && arr[2].get_boolean();
@@ -1145,15 +1240,52 @@ struct Harvester {
         }
     }
 
+    void handleSignerMessage(Relay &r, std::string_view msg) {
+        auto json = tao::json::from_string(msg);
+        const auto &arr = json.get_array();
+        if (arr.size() < 2 || !arr[0].is_string()) return;
+        const auto &type = arr[0].get_string();
+
+        if (type == "EVENT" && arr.size() >= 3) {
+            signers.onEvent(r.url, arr[2]);
+        } else if (type == "AUTH" && arr[1].is_string()) {
+            r.authChallenge = arr[1].get_string();
+            if (r.authState != AuthState::Failed && r.authState != AuthState::Sent) sendAuth(r);
+        } else if (type == "OK" && arr.size() >= 3 && arr[1].is_string()) {
+            bool ok = arr[2].is_boolean() && arr[2].get_boolean();
+            std::string reason = arr.size() >= 4 && arr[3].is_string() ? arr[3].get_string() : "";
+            if (arr[1].get_string() == r.authEventId) authDone(r, ok, reason);
+            else if (!ok) r.lastError = "request refused: " + reason;
+        } else if (type == "CLOSED") {
+            std::string reason = arr.size() >= 3 && arr[2].is_string() ? arr[2].get_string() : "closed by relay";
+            if (!(reason.starts_with("auth-required:") && deferUntilAuth(r))) r.lastError = reason;
+        } else if (type == "NOTICE") {
+            r.lastError = arr[1].is_string() ? arr[1].get_string() : "notice";
+        }
+    }
+
 
     void plan() {
         auto snap = TenantRegistry::get();
-        lastSnapshotVersion = snap->version;
+        lastUniverseVersion = snap->universeVersion;
         lastPlanAt = hoytech::curr_time_s();
 
         targets.clear();
         for (const auto &t : snap->tenants) {
             for (const auto &m : t->members) targets[m.pubkey] = targets[m.pubkey] || t->isSeed(m);
+        }
+
+        std::vector<Bytes32> wanted;
+        {
+            std::lock_guard<std::mutex> guard(wantedMutex);
+            for (auto it = wantedProfiles.begin(); it != wantedProfiles.end(); ) {
+                if (it->second + wantedProfileSeconds < lastPlanAt) {
+                    wantedProfiles.erase(it++);
+                    continue;
+                }
+                if (!targets.contains(it->first)) wanted.push_back(it->first);
+                ++it;
+            }
         }
 
         auto bootstrap = parseUrlList(cfg().banyan__harvester__bootstrapRelays);
@@ -1171,6 +1303,7 @@ struct Harvester {
 
         flat_hash_map<Bytes32, RelayList> lists;
         flat_hash_map<std::string, uint64_t> popularity;
+        flat_hash_map<uint64_t, std::vector<std::string>> ownerUrls;
 
         {
             auto txn = env.txn_ro();
@@ -1184,6 +1317,25 @@ struct Harvester {
                 }
                 lists[pk] = std::move(rl);
             }
+
+            // DM relays first, where gift wraps wait, then the owner's inboxes and outboxes
+            for (auto tenantId : signers.readyTenants()) {
+                auto t = snap->findById(tenantId);
+                if (!t) continue;
+
+                const auto &rl = lists[t->pubkey];
+                auto &urls = ownerUrls[tenantId];
+
+                auto addAll = [&](const std::vector<std::string> &from){
+                    for (const auto &url : from) {
+                        if (urls.size() < maxOwnerRelays && std::find(urls.begin(), urls.end(), url) == urls.end()) urls.push_back(url);
+                    }
+                };
+
+                addAll(loadDmRelays(txn, decomp, t->pubkey, allowed));
+                addAll(rl.read);
+                addAll(rl.write);
+            }
         }
 
         // Prefer relays many targets share, so the same few connections cover most of the universe
@@ -1195,36 +1347,82 @@ struct Harvester {
         };
 
         deliveryRelays.clear();
+        outboxRelays.clear();
         for (const auto &[pk, seed] : targets) {
             const auto &rl = lists[pk];
             if (rl.read.size()) deliveryRelays[pk] = pick(rl.read);
+            if (rl.write.size()) {
+                auto &out = outboxRelays[pk];
+                out.assign(rl.write.begin(), rl.write.begin() + std::min(rl.write.size(), maxOutboxRelaysPerAuthor));
+            }
         }
 
-        std::map<std::string, Assignment> plan;
+        std::map<std::string, Assignment> shared;
 
         for (const auto &[pk, seed] : targets) {
             const auto &rl = lists[pk];
 
-            for (const auto &url : pick(rl.write.size() ? rl.write : bootstrap)) plan[url].authors.push_back(pk);
+            for (const auto &url : pick(rl.write.size() ? rl.write : bootstrap)) shared[url].authors.push_back(pk);
 
             if (seed) {
-                for (const auto &url : pick(rl.read.size() ? rl.read : bootstrap)) plan[url].inbox.push_back(pk);
+                for (const auto &url : pick(rl.read.size() ? rl.read : bootstrap)) shared[url].inbox.push_back(pk);
             }
 
             if (!rl.found) {
-                for (const auto &url : bootstrap) plan[url].meta.push_back(pk);
+                for (const auto &url : bootstrap) shared[url].meta.push_back(pk);
             }
         }
 
-        capRelays(plan, bootstrap);
+        for (const auto &pk : wanted) {
+            for (const auto &url : bootstrap) shared[url].meta.push_back(pk);
+        }
 
-        for (auto &[url, a] : plan) {
+        capRelays(shared, bootstrap);
+
+        std::map<std::string, PlanEntry> entries;
+
+        // An owner's own data on their relays is fetched through their session, authenticated as them
+        for (const auto &[tenantId, urls] : ownerUrls) {
+            auto t = snap->findById(tenantId);
+            if (!t) continue;
+
+            for (const auto &url : urls) {
+                auto &e = entries[ownerKey(url, t->pubkey)];
+                e.url = url;
+                e.role = Role::Owner;
+                e.tenantId = tenantId;
+                e.authAs = t->pubkey;
+                e.assignment.authors = { t->pubkey };
+                e.assignment.inbox = { t->pubkey };
+                e.assignment.giftWraps = { t->pubkey };
+
+                if (auto it = shared.find(url); it != shared.end()) {
+                    std::erase(it->second.authors, t->pubkey);
+                    std::erase(it->second.inbox, t->pubkey);
+                }
+            }
+        }
+
+        for (auto &[url, a] : shared) {
+            if (a == Assignment{}) continue;
+
             std::sort(a.authors.begin(), a.authors.end());
             std::sort(a.inbox.begin(), a.inbox.end());
             std::sort(a.meta.begin(), a.meta.end());
+
+            auto &e = entries[url];
+            e.url = url;
+            e.assignment = std::move(a);
         }
 
-        apply(plan);
+        for (const auto &[url, req] : signers.subscriptions()) {
+            auto &e = entries[signerKey(url)];
+            e.url = url;
+            e.role = Role::Signer;
+            e.signerReq = req;
+        }
+
+        apply(entries);
     }
 
     void capRelays(std::map<std::string, Assignment> &plan, const std::vector<std::string> &bootstrap) {
@@ -1268,16 +1466,16 @@ struct Harvester {
         }
     }
 
-    void apply(const std::map<std::string, Assignment> &plan) {
+    void apply(const std::map<std::string, PlanEntry> &entries) {
         for (auto it = relays.begin(); it != relays.end(); ) {
-            if (plan.contains(it->first)) {
+            if (entries.contains(it->first)) {
                 ++it;
                 continue;
             }
 
             // Out of the plan, but still delivering: it stays until its outbox is empty
             auto &r = it->second;
-            if (r.hasDeliveryWork()) {
+            if (r.role == Role::Harvest && r.hasDeliveryWork()) {
                 if (!r.deliveryOnly()) {
                     r.assignment = Assignment{};
                     if (r.ws) refreshAssignment(r);
@@ -1290,13 +1488,28 @@ struct Harvester {
             it = relays.erase(it);
         }
 
-        for (const auto &[url, a] : plan) {
-            auto [it, isNew] = relays.try_emplace(url);
+        for (const auto &[key, e] : entries) {
+            auto [it, isNew] = relays.try_emplace(key);
             auto &r = it->second;
-            if (isNew) r.url = url;
 
-            if (r.assignment == a) continue;
-            r.assignment = a;
+            if (isNew) {
+                r.key = key;
+                r.url = e.url;
+                r.role = e.role;
+                r.tenantId = e.tenantId;
+                r.authAs = e.authAs;
+            }
+
+            if (r.role == Role::Signer) {
+                if (r.signerReq != e.signerReq) {
+                    r.signerReq = e.signerReq;
+                    sendRaw(r, r.signerReq);
+                }
+                continue;
+            }
+
+            if (r.assignment == e.assignment) continue;
+            r.assignment = e.assignment;
             if (r.ws) refreshAssignment(r);
         }
     }
@@ -1306,7 +1519,13 @@ struct Harvester {
         uint64_t now = hoytech::curr_time_s();
 
         try {
-            bool registryChanged = TenantRegistry::get()->version != lastSnapshotVersion;
+            signers.tick(now);
+        } catch (std::exception &e) {
+            LE << "Banyan harvester: remote signers failed: " << e.what();
+        }
+
+        try {
+            bool registryChanged = TenantRegistry::get()->universeVersion != lastUniverseVersion;
 
             if (wakeRequested.exchange(false) || registryChanged || now >= lastPlanAt + cfg().banyan__harvester__replanIntervalSeconds) {
                 plan();
@@ -1315,29 +1534,41 @@ struct Harvester {
             LE << "Banyan harvester: planning failed: " << e.what();
         }
 
-        for (auto &[url, result] : prober.takeResults()) {
-            auto it = relays.find(url);
+        for (auto &res : prober.takeResults()) {
+            auto it = relays.find(res.key);
             if (it == relays.end()) continue;
             auto &r = it->second;
             r.probing = false;
 
-            if (result == ProbeResult::Reachable) {
+            if (res.outcome.result == ProbeResult::Reachable) {
+                bool secure = r.url.starts_with("wss://");
+                auto parts = parseRelayUrl(r.url);
+                auto hp = splitHostPort(parts.host, secure);
+                auto *userData = new std::string(r.key);
+
                 r.connecting = true;
-                hub.connect(url, (void*)new std::string(url), {}, 15'000, group);
-            } else if (result == ProbeResult::PrivateAddress) {
+                if (!hub.connectPinned(res.outcome.address, res.outcome.port, secure, hp.host, parts.path, userData, 15'000, group, true)) {
+                    delete userData;
+                    r.connecting = false;
+                    r.failures++;
+                    r.lastError = "connection failed";
+                    r.nextAttemptAt = now + backoffSeconds(r.failures);
+                }
+            } else if (res.outcome.result == ProbeResult::PrivateAddress) {
                 r.lastError = "resolves to a private address";
                 r.nextAttemptAt = now + maxBackoffSeconds;
-                LW << "Banyan harvester: " << url << " resolves to a private address, skipped";
+                LW << "Banyan harvester: " << r.url << " resolves to a private address, skipped";
             } else {
                 r.failures++;
                 r.lastError = "unreachable";
                 r.nextAttemptAt = now + backoffSeconds(r.failures);
-                LI << "Banyan harvester: " << url << " is unreachable, retrying in " << backoffSeconds(r.failures) << "s";
+                LI << "Banyan harvester: " << r.url << " is unreachable, retrying in " << backoffSeconds(r.failures) << "s";
             }
         }
 
         try {
             distribute(now);
+            publishToOutboxes(now);
         } catch (std::exception &e) {
             LE << "Banyan harvester: distribution failed: " << e.what();
         }
@@ -1373,14 +1604,19 @@ struct Harvester {
             ++it;
         }
 
-        for (auto &[url, r] : relays) {
+        for (auto &[relayKey, r] : relays) {
             if (!r.ws && !r.connecting && !r.probing && now >= r.nextAttemptAt) {
                 r.probing = true;
-                prober.submit(url);
+                prober.submit(relayKey, r.url);
             }
 
-            if (r.ws && (r.authState == AuthState::Sent || r.authState == AuthState::Wanted) && now > r.authSentAt + authTimeoutSeconds) {
-                authDone(r, false, r.authState == AuthState::Sent ? "no answer" : "auth-required, but no challenge was sent");
+            bool authPending = r.authState == AuthState::Sent || r.authState == AuthState::Wanted || r.authState == AuthState::Signing;
+            uint64_t authTimeout = r.role == Role::Owner ? ownerAuthTimeoutSeconds : authTimeoutSeconds;
+
+            if (r.ws && authPending && now > r.authSentAt + authTimeout) {
+                authDone(r, false, r.authState == AuthState::Sent ? "no answer"
+                                 : r.authState == AuthState::Signing ? "the remote signer did not answer"
+                                 : "auth-required, but no challenge was sent");
             }
 
             if (r.ws && r.inflight.size()) {
@@ -1410,9 +1646,11 @@ struct Harvester {
     void updateStatus() {
         tao::json::value relaysJson = tao::json::empty_array;
 
-        for (const auto &[url, r] : relays) {
+        for (const auto &[relayKey, r] : relays) {
             relaysJson.emplace_back(tao::json::value({
-                { "url", url },
+                { "url", r.url },
+                { "role", std::string(roleName(r.role)) },
+                { "authAs", r.role == Role::Owner ? tao::json::value(to_hex(r.authAs.sv())) : tao::json::value(tao::json::null) },
                 { "connected", r.ws != nullptr },
                 { "subs", r.active.size() },
                 { "queued", r.queue.size() },
@@ -1432,6 +1670,7 @@ struct Harvester {
             { "targets", targets.size() },
             { "relays", std::move(relaysJson) },
             { "delivered", deliveredTotal },
+            { "published", publishedTotal },
             { "authPubkey", key ? tao::json::value(to_hex(key->pubkey)) : tao::json::value(tao::json::null) },
         });
     }
@@ -1455,6 +1694,7 @@ struct Harvester {
         });
         ticker.detach();
 
+        running = true;
         hub.run();
     }
 };

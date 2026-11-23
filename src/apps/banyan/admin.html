@@ -99,6 +99,8 @@ legend { font-weight: 650; padding: 0; margin-bottom: 8px; }
 .pk-list li:last-child { border-bottom: 0; }
 .pk-list .id { flex: 1; }
 .pk-list .av { width: 28px; height: 28px; font-size: .8rem; }
+.pk-list .ev { flex: 1; min-width: 0; font-family: var(--mono); font-size: .85rem; overflow-wrap: anywhere; }
+.signer-state { font-weight: 600; }
 .id { display: flex; flex-direction: column; min-width: 0; }
 .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .via { font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }
@@ -163,6 +165,7 @@ const CIRCLES = [["owner", "Owner"], ["pinned", "Pinned"], ["primary", "Primary 
 const LOADING = '<p class="muted pad">Loading...</p>';
 const BACK = '<a class="back" href="#/">&larr; All people</a>';
 const BAD_PK = "Enter a valid npub or a 64-character hex pubkey.";
+const BAD_ID = "Enter a note1, nevent1 or 64-character hex event id.";
 const RTF = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
 
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -218,24 +221,46 @@ function convertBits(data, from, to, pad) {
   else if (!pad && (bits >= from || ((acc << (to - bits)) & max))) return null;
   return out;
 }
-function npubEncode(hex) {
-  if (!/^[0-9a-f]{64}$/i.test(hex || "")) return String(hex ?? "");
+const hexOfBytes = bytes => bytes.map(b => b.toString(16).padStart(2, "0")).join("");
+function bech32Encode(hrp, hex) {
   const data = convertBits(hex.match(/../g).map(h => parseInt(h, 16)), 8, 5, true);
-  const mod = polymod([...hrpExpand("npub"), ...data, 0, 0, 0, 0, 0, 0]) ^ 1;
-  let out = "npub1";
+  const mod = polymod([...hrpExpand(hrp), ...data, 0, 0, 0, 0, 0, 0]) ^ 1;
+  let out = hrp + "1";
   for (const d of data) out += BECH[d];
   for (let i = 0; i < 6; i++) out += BECH[(mod >>> (5 * (5 - i))) & 31];
   return out;
 }
-function npubDecode(str) {
+function bech32Decode(str) {
   const s = String(str ?? "").trim();
   if (s !== s.toLowerCase() && s !== s.toUpperCase()) return null;
-  const low = s.toLowerCase();
-  if (!low.startsWith("npub1") || low.length > 90) return null;
-  const data = [...low.slice(5)].map(c => BECH.indexOf(c));
-  if (data.length < 6 || data.includes(-1) || polymod([...hrpExpand("npub"), ...data]) !== 1) return null;
+  const low = s.toLowerCase(), sep = low.lastIndexOf("1");
+  if (sep < 1 || low.length > 5000) return null;
+  const hrp = low.slice(0, sep), data = [...low.slice(sep + 1)].map(c => BECH.indexOf(c));
+  if (data.length < 6 || data.includes(-1) || polymod([...hrpExpand(hrp), ...data]) !== 1) return null;
   const bytes = convertBits(data.slice(0, -6), 5, 8, false);
-  return bytes && bytes.length === 32 ? bytes.map(b => b.toString(16).padStart(2, "0")).join("") : null;
+  return bytes ? { hrp, bytes } : null;
+}
+function npubEncode(hex) {
+  return /^[0-9a-f]{64}$/i.test(hex || "") ? bech32Encode("npub", hex.toLowerCase()) : String(hex ?? "");
+}
+function npubDecode(str) {
+  const d = bech32Decode(str);
+  return d && d.hrp === "npub" && d.bytes.length === 32 ? hexOfBytes(d.bytes) : null;
+}
+const noteOf = hex => /^[0-9a-f]{64}$/i.test(hex || "") ? bech32Encode("note", hex.toLowerCase()) : String(hex ?? "");
+// note1, nevent1 (TLV type 0 is the id) or hex
+function eventIdToHex(input) {
+  let s = String(input ?? "").trim();
+  if (s.startsWith("nostr:")) s = s.slice(6);
+  if (/^[0-9a-f]{64}$/i.test(s)) return s.toLowerCase();
+  const d = bech32Decode(s);
+  if (!d) return null;
+  if (d.hrp === "note") return d.bytes.length === 32 ? hexOfBytes(d.bytes) : null;
+  if (d.hrp !== "nevent") return null;
+  for (let i = 0; i + 2 <= d.bytes.length; i += 2 + d.bytes[i + 1]) {
+    if (d.bytes[i] === 0 && d.bytes[i + 1] === 32) return hexOfBytes(d.bytes.slice(i + 2, i + 34));
+  }
+  return null;
 }
 function toHex(input) {
   const s = String(input ?? "").trim();
@@ -501,6 +526,22 @@ function detailShell() {
     ${listEditor("blocked", "block-form", "Blocked", "Never in the universe, even with a high score.", "Block")}
   </section>
 </div>
+<div class="cols">
+  <section class="card">
+    <h2>Muted threads</h2>
+    <p class="muted small">The relay stops serving a muted note and every reply, reaction or comment under it. Threads muted in the owner's Nostr client (their NIP-51 mute list) are hidden too.${upTo("mutedThreads")}</p>
+    <form id="mute-form" class="inline-form" novalidate><input name="id" placeholder="note1..., nevent1... or hex id" aria-label="Mute a thread" autocomplete="off" autocapitalize="none" spellcheck="false"><button class="btn ghost">Mute</button></form>
+    <p class="msg" data-msg="muted" hidden></p>
+    <p class="muted small" id="muted-info"></p>
+    <ul class="pk-list" id="muted-list" data-zone="muted"></ul>
+  </section>
+  <section class="card">
+    <h2>Remote signer</h2>
+    <p class="muted small">Some relays only serve your own data, like your direct messages, once you sign in to them. Connect a NIP-46 remote signer and this relay signs in as you to fetch it. It only asks to sign sign-in events (kind 22242), never notes.</p>
+    <div id="signer" data-zone="signer"></div>
+    <p class="msg" data-msg="signer" hidden></p>
+  </section>
+</div>
 <section class="card">
   <div class="head"><h2 class="grow">Universe <span class="muted count" id="m-count"></span></h2><input id="member-filter" type="search" placeholder="Filter by name or npub" aria-label="Filter members" autocomplete="off"></div>
   <p class="msg" data-msg="members" hidden></p>
@@ -535,6 +576,8 @@ function applyTenant(t, withSettings) {
   $("#t-summary").innerHTML = summaryHtml(t);
   paintList("pinned");
   paintList("blocked");
+  paintMuted();
+  paintSigner();
   paintMembers();
   if (withSettings) fillSettings(t.settings || {});
 }
@@ -566,6 +609,78 @@ function paintList(kind) {
     ? pks.map(pk => `<li>${avatar(S.byPk.get(pk) || { pubkey: pk })}${idCell(pk, S.byPk.get(pk))}<button class="btn ghost sm" data-act="${verb}" data-pk="${esc(pk)}">Remove</button></li>`).join("")
     : `<li class="muted small">${kind === "pinned" ? "Nobody pinned." : "Nobody blocked."}</li>`;
 }
+function paintMuted() {
+  const ul = $("#muted-list");
+  if (!ul) return;
+  const ids = (S.tenant.settings || {}).mutedThreads || [], m = S.tenant.muted || {};
+  ul.innerHTML = ids.length
+    ? ids.map(id => `<li><span class="ev" title="${esc(noteOf(id))}">${esc(short(noteOf(id)))}</span><button class="btn ghost sm" data-act="unmute" data-id="${esc(id)}">Unmute</button></li>`).join("")
+    : '<li class="muted small">No thread muted here.</li>';
+  const fromList = m.fromMuteList ? `, ${fmt(m.fromMuteList)} of them muted from the owner's client` : "";
+  $("#muted-info").textContent = `${fmt(m.hiddenEvents)} events hidden${fromList}.`;
+}
+async function addMuted(form) {
+  const input = form.elements.id, hex = eventIdToHex(input.value), ids = (S.tenant.settings || {}).mutedThreads || [];
+  if (!hex) return setMsg("muted", BAD_ID);
+  if (ids.includes(hex)) return setMsg("muted", "Already muted.");
+  await act(form.querySelector("button"), "", "muted", async () => {
+    await tenantRpc("updatetenant", [S.tenant.pubkey, { mutedThreads: [...ids, hex] }], false);
+    input.value = "";
+  });
+}
+function unmute(btn) {
+  const ids = ((S.tenant.settings || {}).mutedThreads || []).filter(x => x !== btn.dataset.id);
+  return act(btn, "", "muted", () => tenantRpc("updatetenant", [S.tenant.pubkey, { mutedThreads: ids }], false));
+}
+
+const SIGNER_STATES = {
+  waiting: "Waiting for your signer app.",
+  connecting: "Connecting to your signer...",
+  verifying: "Checking which key your signer holds...",
+  ready: "Connected. This relay signs in as you where a relay asks for it.",
+  failed: "Your signer could not connect.",
+};
+function paintSigner() {
+  const box = $("#signer");
+  if (!box) return;
+  clearTimeout(S.signerPoll);
+  const s = S.tenant.signer;
+  if (!s) {
+    box.innerHTML = `<form id="bunker-form" class="inline-form" novalidate><input name="bunker" placeholder="bunker://..." aria-label="Bunker URL" autocomplete="off" autocapitalize="none" spellcheck="false"><button class="btn ghost">Connect</button></form>
+<p class="muted small">Paste the bunker:// URL your signer gives you, or <button class="btn ghost sm" data-act="nostrconnect">get a nostrconnect:// link</button> to paste in your signer app.</p>`;
+    return;
+  }
+  const approve = httpsUrl(s.authUrl);
+  box.innerHTML = `<p><span class="signer-state">${esc(SIGNER_STATES[s.state] || s.state)}</span></p>
+${s.nostrconnect ? `<p class="small">Paste this link in your signer app:</p>${urlRow(s.nostrconnect)}` : ""}
+${s.signerPubkey ? `<p class="small muted">Signer <span class="mono" title="${esc(npubEncode(s.signerPubkey))}">${esc(short(npubEncode(s.signerPubkey)))}</span> on ${esc((s.relays || []).join(", "))}</p>` : ""}
+${approve ? `<p class="small">Your signer asks you to approve this relay: <a href="${esc(approve)}" target="_blank" rel="noopener noreferrer">open the approval page</a>.</p>` : ""}
+${s.lastError ? `<p class="msg err">${esc(s.lastError)}</p>` : ""}
+<button class="btn ghost sm warn" data-act="removesigner">Disconnect</button>`;
+  // The harvester connects in the background, so the state is refreshed until it settles
+  if (["waiting", "connecting", "verifying"].includes(s.state)) {
+    const tok = S.nav;
+    S.signerPoll = setTimeout(() => { if (tok === S.nav) refreshTenant().catch(e => setMsg("signer", errText(e))); }, 3000);
+  }
+}
+async function signerRpc(btn, method, params) {
+  await act(btn, "", "signer", async () => {
+    const tok = S.nav, signer = await rpc(method, [S.tenant.pubkey, ...params]);
+    if (tok !== S.nav) return;
+    S.tenant.signer = signer;
+    paintSigner();
+  });
+}
+function connectBunker(form) {
+  const url = form.elements.bunker.value.trim();
+  if (!url.startsWith("bunker://")) return setMsg("signer", "Enter the bunker:// URL from your signer.");
+  return signerRpc(form.querySelector("button"), "connectsigner", [url]);
+}
+function removeRemoteSigner(btn) {
+  if (!confirm("Disconnect the remote signer? Relays that need you to sign in will stop serving your data here.")) return;
+  return signerRpc(btn, "removesigner", []);
+}
+
 function paintMembers() {
   const box = $("#t-members");
   if (!box) return;
@@ -686,15 +801,16 @@ async function loadHarvest() {
   const box = $("#harvest");
   if (tok !== S.nav || !box) return;
   const relays = Array.isArray(h.relays) ? h.relays : [], on = relays.filter(r => r.connected).length;
-  const auth = h.authPubkey ? `<p class="small muted">Answers NIP-42 AUTH as <span class="mono" title="${esc(npubEncode(h.authPubkey))}">${esc(short(npubEncode(h.authPubkey)))}</span>. Whitelist this key on paid or private relays.</p>` : "";
-  box.innerHTML = `<p class="small">${fmt(h.targets)} pubkeys targeted, ${fmt(on)} of ${fmt(relays.length)} relays connected, ${fmt(h.delivered)} events delivered to inboxes. <span class="muted">Updated ${esc(new Date().toLocaleTimeString("en"))}.</span></p>${auth}`
+  const auth = h.authPubkey ? `<p class="small muted">Answers NIP-42 AUTH as <span class="mono" title="${esc(npubEncode(h.authPubkey))}">${esc(short(npubEncode(h.authPubkey)))}</span>. Whitelist this key on paid or private relays. People with a remote signer sign in as themselves on their own relays.</p>` : "";
+  box.innerHTML = `<p class="small">${fmt(h.targets)} pubkeys targeted, ${fmt(on)} of ${fmt(relays.length)} relays connected, ${fmt(h.delivered)} events delivered to inboxes, ${fmt(h.published)} published to their authors' relays. <span class="muted">Updated ${esc(new Date().toLocaleTimeString("en"))}.</span></p>${auth}`
     + (relays.length ? `<div class="relays">${relays.map(relayRow).join("")}</div>` : '<p class="muted empty">No relays in use yet.</p>');
 }
 function relayRow(r) {
   const stats = [["Subscriptions", r.subs], ["Authors", r.authors], ["Inbox targets", r.inboxTargets], ["Events received", r.eventsReceived], ["Delivered", r.delivered], ["Waiting to deliver", r.deliveryQueue]];
-  const auth = { ok: ", authenticated", sent: ", authenticating", wanted: ", waiting for an AUTH challenge", failed: ", AUTH refused" }[r.auth] || "";
+  const auth = { ok: ", authenticated", sent: ", authenticating", signing: ", waiting for the remote signer", wanted: ", waiting for an AUTH challenge", failed: ", AUTH refused" }[r.auth] || "";
+  const role = r.role === "owner" && r.authAs ? ` as ${short(npubEncode(r.authAs))}` : r.role === "signer" ? " (remote signer)" : "";
   return `<article class="relay ${r.connected ? "on" : "off"}">
-  <div class="r-head"><span class="dot"></span><span class="mono">${esc(r.url)}</span><span class="state">${r.connected ? "Connected" : "Disconnected"}${esc(auth)}</span></div>
+  <div class="r-head"><span class="dot"></span><span class="mono">${esc(r.url)}</span><span class="state">${r.connected ? "Connected" : "Disconnected"}${esc(auth + role)}</span></div>
   <dl class="kv">${stats.map(([k, v]) => `<div><dt>${k}</dt><dd>${fmt(v)}</dd></div>`).join("")}</dl>
   ${r.lastError ? `<p class="r-err">${esc(r.lastError)}</p>` : ""}
 </article>`;
@@ -709,6 +825,9 @@ const ACTIONS = {
   unpin: btn => toggle(btn, "pinned", false),
   block: btn => toggle(btn, "blocked", true),
   unblock: btn => toggle(btn, "blocked", false),
+  unmute,
+  nostrconnect: btn => signerRpc(btn, "nostrconnect", []),
+  removesigner: removeRemoteSigner,
   harvest: btn => act(btn, "Refreshing...", "harvest", loadHarvest),
 };
 const FORMS = {
@@ -716,6 +835,8 @@ const FORMS = {
   "settings-form": saveSettings,
   "pin-form": f => addToList(f, "pinned"),
   "block-form": f => addToList(f, "blocked"),
+  "mute-form": addMuted,
+  "bunker-form": connectBunker,
 };
 document.addEventListener("click", e => {
   const el = e.target.closest("[data-act]");

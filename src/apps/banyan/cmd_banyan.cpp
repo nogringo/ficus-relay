@@ -9,6 +9,7 @@
 #include "TrustEngine.h"
 #include "BanyanHttp.h"
 #include "Pruner.h"
+#include "Zaps.h"
 
 
 static const char USAGE[] =
@@ -79,6 +80,17 @@ void cmd_banyan(const std::vector<std::string> &subArgs) {
 
         banyan::EngagementCache cache;
         auto members = banyan::computeUniverse(*t, now, cache);
+
+        // No resolver thread here: receipts waiting for their recipient's LNURL are checked now
+        if (auto unresolved = banyan::takeUnresolvedZappers(); unresolved.size()) {
+            std::vector<Bytes32> recipients;
+            for (const auto &[pk, seeds] : unresolved) recipients.push_back(pk);
+
+            if (banyan::resolveZapperKeys(recipients).changed.size()) {
+                cache.clear();
+                members = banyan::computeUniverse(*t, now, cache);
+            }
+        }
 
         auto txn = env.txn_rw();
         banyan::storeComputedUniverse(txn, t->id, now, members);

@@ -2,6 +2,7 @@
 
 #include "PluginEventSifter.h"
 #include "PrometheusMetrics.h"
+#include "apps/banyan/Harvester.h"
 
 
 void RelayServer::runWriter(ThreadPool<MsgWriter>::Thread &thr) {
@@ -120,6 +121,10 @@ void RelayServer::runWriter(ThreadPool<MsgWriter>::Thread &thr) {
             MsgWriter::AddEvent *addEventMsg = static_cast<MsgWriter::AddEvent*>(newEvent.userData);
 
             sendOKResponse(addEventMsg->connId, eventIdHex, written, message);
+
+            if (newEvent.status == EventWriteStatus::Written && addEventMsg->tenantId) {
+                banyan::harvesterPublish(addEventMsg->tenantId, newEvent.packedStr, newEvent.jsonStr);
+            }
         }
     }
 }

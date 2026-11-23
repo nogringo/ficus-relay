@@ -11,6 +11,7 @@
 #include "DBQuery.h"
 #include "events.h"
 #include "Decompressor.h"
+#include "Zaps.h"
 
 
 namespace banyan {
@@ -141,37 +142,68 @@ static secp256k1_context *verifyCtx() {
     return ctx;
 }
 
-struct ZapRequest {
-    std::string id;
+struct Zap {
+    std::string requestId;
     Bytes32 sender;
     Bytes32 recipient;
+    Bytes32 receiptSigner;
+    uint64_t msats = 0;
 };
 
-// NIP-57: anyone can publish a receipt, so only the zap request it embeds, signed by the sender, says who zapped whom
-static std::optional<ZapRequest> verifiedZapRequest(lmdb::txn &txn, Decompressor &decomp, uint64_t levId, const PackedEventView &receipt) {
+// NIP-57: anyone can publish a receipt, so only the zap request it embeds, signed by the sender, says who zapped whom.
+// Whether the zap was paid is checked separately: the receipt must come from the recipient's LNURL server.
+static std::optional<Zap> parseZapReceipt(lmdb::txn &txn, Decompressor &decomp, uint64_t levId, const PackedEventView &receipt) {
     auto receiptRecipient = firstPTag(receipt);
     if (!receiptRecipient) return std::nullopt;
 
     try {
         auto json = tao::json::from_string(getEventJson(txn, decomp, levId));
+        std::optional<std::string> description;
+        std::optional<uint64_t> msats;
 
         for (const auto &tag : json.at("tags").get_array()) {
             const auto &arr = tag.get_array();
-            if (arr.size() < 2 || !arr[0].is_string() || arr[0].get_string() != "description") continue;
-
-            std::string packedStr, jsonStr;
-            parseAndVerifyEvent(tao::json::from_string(arr[1].get_string()), verifyCtx(), true, false, packedStr, jsonStr);
-            PackedEventView request(packedStr);
-
-            if (request.kind() != 9734) return std::nullopt;
-            if (firstPTag(request) != receiptRecipient) return std::nullopt;
-
-            return ZapRequest{ std::string(request.id()), Bytes32(request.pubkey()), *receiptRecipient };
+            if (arr.size() < 2 || !arr[0].is_string() || !arr[1].is_string()) continue;
+            if (arr[0].get_string() == "description" && !description) description = arr[1].get_string();
+            else if (arr[0].get_string() == "bolt11" && !msats) msats = bolt11AmountMsats(arr[1].get_string());
         }
+
+        if (!description || !msats) return std::nullopt;
+
+        std::string packedStr, jsonStr;
+        auto requestJson = tao::json::from_string(*description);
+        parseAndVerifyEvent(requestJson, verifyCtx(), true, false, packedStr, jsonStr);
+        PackedEventView request(packedStr);
+
+        if (request.kind() != 9734) return std::nullopt;
+        if (firstPTag(request) != receiptRecipient) return std::nullopt;
+
+        for (const auto &tag : requestJson.at("tags").get_array()) {
+            const auto &arr = tag.get_array();
+            if (arr.size() < 2 || !arr[0].is_string() || arr[0].get_string() != "amount" || !arr[1].is_string()) continue;
+            if (arr[1].get_string() != std::to_string(*msats)) return std::nullopt;
+        }
+
+        return Zap{ std::string(request.id()), Bytes32(request.pubkey()), *receiptRecipient, Bytes32(receipt.pubkey()), *msats };
     } catch (std::exception &) {
     }
 
     return std::nullopt;
+}
+
+// Receipts that can't be checked yet are left out, and the seed is recomputed once the recipient's LNURL answered
+static bool genuineZap(lmdb::txn &txn, const Zap &zap, const Bytes32 &seed) {
+    if (!cfg().banyan__trust__verifyZapReceipts) return true;
+
+    switch (checkZapper(txn, zap.recipient, zap.receiptSigner)) {
+        case ZapperCheck::Valid: return true;
+        case ZapperCheck::Invalid: return false;
+        case ZapperCheck::Unknown:
+            noteUnresolvedZapper(zap.recipient, seed);
+            return false;
+    }
+
+    return false;
 }
 
 static tao::json::value uintArray(const std::vector<uint64_t> &v) {
@@ -223,6 +255,13 @@ std::vector<PeerEngagement> computeEngagement(const Bytes32 &seed, uint64_t now)
 
     flat_hash_set<std::string> seenZapRequests;
 
+    struct OutgoingZap {
+        Zap zap;
+        double weight;
+    };
+
+    std::vector<OutgoingZap> outgoingZaps;
+
     foreachByFilter(txn, tao::json::value({
         { "kinds", tao::json::value::array({ uint64_t(9735) }) },
         { "#P", tao::json::value::array({ seedHex }) },
@@ -232,19 +271,23 @@ std::vector<PeerEngagement> computeEngagement(const Bytes32 &seed, uint64_t now)
         auto ev = lookupEventByLevId(txn, levId);
         PackedEventView packed(ev.buf);
 
-        auto zap = verifiedZapRequest(txn, decomp, levId, packed);
+        auto zap = parseZapReceipt(txn, decomp, levId, packed);
         if (!zap || zap->sender != seed || zap->recipient == seed) return;
-        if (!seenZapRequests.insert(zap->id).second) return;
+        if (!seenZapRequests.insert(zap->requestId).second) return;
 
-        entry(zap->recipient).out[size_t(EngagementType::Zap)] += decay(packed.created_at());
+        outgoingZaps.push_back(OutgoingZap{ *zap, decay(packed.created_at()) * zapUnits(zap->msats) });
     });
 
-    if (peers.empty()) return {};
+    if (peers.empty() && outgoingZaps.empty()) return {};
 
     // Peers the seed never engaged with score zero, so they are left out of the scan itself:
     // a flood of mentions from strangers can't push real engagement past the limit.
+    flat_hash_set<Bytes32> candidateSet;
+    for (const auto &[pk, e] : peers) candidateSet.insert(pk);
+    for (const auto &z : outgoingZaps) candidateSet.insert(z.zap.recipient);
+
     tao::json::value candidates = tao::json::empty_array;
-    for (const auto &[pk, e] : peers) candidates.emplace_back(to_hex(pk.sv()));
+    for (const auto &pk : candidateSet) candidates.emplace_back(to_hex(pk.sv()));
 
     foreachByFilter(txn, tao::json::value({
         { "#p", tao::json::value::array({ seedHex }) },
@@ -276,12 +319,21 @@ std::vector<PeerEngagement> computeEngagement(const Bytes32 &seed, uint64_t now)
         auto ev = lookupEventByLevId(txn, levId);
         PackedEventView packed(ev.buf);
 
-        auto zap = verifiedZapRequest(txn, decomp, levId, packed);
-        if (!zap || zap->recipient != seed || zap->sender == seed || !peers.contains(zap->sender)) return;
-        if (!seenZapRequests.insert(zap->id).second) return;
+        auto zap = parseZapReceipt(txn, decomp, levId, packed);
+        if (!zap || zap->recipient != seed || zap->sender == seed || !candidateSet.contains(zap->sender)) return;
+        if (!seenZapRequests.insert(zap->requestId).second) return;
+        if (!genuineZap(txn, *zap, seed)) return;
 
-        entry(zap->sender).in[size_t(EngagementType::Zap)] += decay(packed.created_at());
+        entry(zap->sender).in[size_t(EngagementType::Zap)] += decay(packed.created_at()) * zapUnits(zap->msats);
     });
+
+    // Checked last, and only for mutual peers: the others score zero anyway, and checking means asking their LNURL server
+    for (const auto &z : outgoingZaps) {
+        auto it = peers.find(z.zap.recipient);
+        if (it == peers.end() || std::none_of(it->second.in.begin(), it->second.in.end(), [](double v){ return v > 0; })) continue;
+        if (!genuineZap(txn, z.zap, seed)) continue;
+        it->second.out[size_t(EngagementType::Zap)] += z.weight;
+    }
 
     std::vector<PeerEngagement> output;
 

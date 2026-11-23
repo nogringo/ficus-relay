@@ -14,8 +14,8 @@ RUN pacman -Syu --noconfirm
 RUN pacman -S --noconfirm \
 # build essentials
   base-devel git \
-# flatbuffers, lmdb, libsecp256k1
-  flatbuffers lmdb libsecp256k1
+# flatbuffers, lmdb, libsecp256k1, curl
+  flatbuffers lmdb libsecp256k1 curl
 
 # update submodules
 RUN git submodule update --init 

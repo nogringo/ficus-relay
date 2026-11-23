@@ -134,12 +134,42 @@ tables:
           unique: true
       - name: authoredBackfilledAt
       - name: inboxBackfilledAt
+      - name: giftWrapsBackfilledAt
 
   ## Banyan: key the harvester signs NIP-42 AUTH with on other relays (single entry)
   HarvesterKey:
     fields:
       - name: secretKey
         type: ubytes
+
+  ## Banyan: nostrPubkeys a zap recipient's LNURL server signs receipts with (NIP-57), concatenated 32-byte keys
+  ZapperKey:
+    fields:
+      - name: pubkey
+        type: ubytes
+        index:
+          unique: true
+      - name: nostrPubkeys
+        type: ubytes
+      - name: lnurl
+        type: string
+      - name: checkedAt
+
+  ## Banyan: NIP-46 remote signer an owner connected, so the harvester can AUTH as them
+  TenantSigner:
+    primaryKey: tenantId
+    fields:
+      - name: tenantId
+      - name: clientSecretKey
+        type: ubytes
+      - name: signerPubkey # empty until a nostrconnect:// signer answers
+        type: ubytes
+      - name: relays # comma-separated
+        type: string
+      - name: secret
+        type: string
+      - name: createdAt
+      - name: connectedAt # 0 until the signer proved it holds the owner's key
 
 tablesRaw:
   ## Raw nostr event JSON, possibly compressed

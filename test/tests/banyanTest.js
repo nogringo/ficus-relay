@@ -1,8 +1,10 @@
-// Banyan virtual relays: path routing, universe scoping, incoming engagement, trust circles, admin API, thread filters,
-// owner self-management, pruning, and the harvester's NIP-42 AUTH and inbox delivery against a fake upstream relay.
+// Banyan virtual relays: path routing, universe scoping, incoming engagement, trust circles (zap amounts and LNURL checks),
+// admin API, thread filters and muting, owner self-management, pruning, and against fake upstream relays: the harvester's
+// NIP-42 AUTH, inbox and outbox delivery, and AUTH as the owner through a NIP-46 remote signer.
 
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -10,7 +12,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { WebSocketServer } from "ws";
 import { matchFilters } from "@nostr/tools/filter";
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from "@nostr/tools/pure";
-import { npubEncode } from "@nostr/tools/nip19";
+import { encodeBytes, neventEncode, npubEncode } from "@nostr/tools/nip19";
+import { decrypt as nip44Decrypt, encrypt as nip44Encrypt, getConversationKey } from "@nostr/tools/nip44";
 
 const workDir = path.join(os.tmpdir(), "strfry-banyan-tests");
 const dbDir = path.join(workDir, "db");
@@ -20,6 +23,13 @@ const httpBase = `http://127.0.0.1:${port}`;
 const wsBase = `ws://127.0.0.1:${port}`;
 const upstreamPort = 40561;
 const upstreamUrl = `ws://127.0.0.1:${upstreamPort}`;
+const lnurlPort = 40562;
+const outboxPort = 40563;
+const outboxUrl = `ws://127.0.0.1:${outboxPort}`;
+const bunkerPort = 40564;
+const bunkerUrl = `ws://127.0.0.1:${bunkerPort}`;
+const dmPort = 40565;
+const dmUrl = `ws://127.0.0.1:${dmPort}`;
 
 const pass = (msg) => console.log(`Pass: ${msg}`);
 
@@ -53,6 +63,17 @@ function sign(key, { kind = 1, content = "", tags = [], created_at } = {}) {
 
 function strfry(args, input) {
   return execFileSync("./strfry", ["--config", cfgPath, ...args], { encoding: "utf-8", input, stdio: ["pipe", "pipe", "pipe"] });
+}
+
+// Keeps the event loop free, for commands that call the fake LNURL server of this process
+function strfryAsync(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("./strfry", ["--config", cfgPath, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "", err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("exit", (code) => (code === 0 ? resolve(out) : reject(new Error(`strfry ${args.join(" ")} failed:\n${err}`))));
+  });
 }
 
 function sha256(s) {
@@ -130,7 +151,8 @@ async function rpc(key, method, params = [], { url = "https://relay.test/", tamp
     kind: 27235,
     created_at: Math.floor(Date.now() / 1000),
     content: "",
-    tags: [["u", url], ["method", "POST"], ["payload", tamperPayload ? sha256(body + "x") : sha256(body)]],
+    // The relay refuses a reused NIP-98 event, and polling repeats the same request within a second
+    tags: [["u", url], ["method", "POST"], ["payload", tamperPayload ? sha256(body + "x") : sha256(body)], ["nonce", Math.random().toString(36).slice(2)]],
   });
   const res = await fetch(`${httpBase}/`, {
     method: "POST",
@@ -154,6 +176,9 @@ const zed = makeKey(); // alice zapped zed once, zed replies to alice: primary t
 const forger = makeKey(); // forges receipts saying alice zapped them, and reacts to alice a lot
 const flooder = makeKey(); // alice answered once, then floods alice with reactions
 const lnurl = makeKey(); // signs zap receipts, like an LNURL server
+const yan = makeKey(); // alice zapped yan a lot of sats once, yan replied once: amounts count
+const mal = makeKey(); // receipts for alice's zap to mal are signed by someone else than mal's LNURL server
+const bunkerKey = makeKey(); // the NIP-46 remote signer holding alice's key
 const outsider = makeKey(); // in no universe and mentions no seed: pruned
 const newcomer = makeKey(); // only reaches alice through her Banyan; alice answers, so they enter her circle
 const passerby = makeKey(); // replies to alice on her Banyan, then deletes it
@@ -185,18 +210,36 @@ function seedEvents() {
     add(sign(stranger, { content: `stranger replies ${i}`, tags: [["e", a1.id], ["p", alice.pub]] }));
   }
 
+  // The LNURL server of zed, yan and mal signs receipts with lnurl's key
+  for (const [k, name] of [[zed, "zed"], [yan, "yan"], [mal, "mal"]]) {
+    const lud06 = encodeBytes("lnurl", new TextEncoder().encode(`http://127.0.0.1:${lnurlPort}/.well-known/lnurlp/${name}`));
+    add(sign(k, { kind: 0, content: JSON.stringify({ name, lud06 }) }));
+  }
+
   const zapRequest = sign(alice, { kind: 9734, tags: [["p", zed.pub], ["relays", "wss://relay.test"]] });
-  const receipt = (signer, recipient, description) => {
-    const tags = [["p", recipient.pub], ["P", alice.pub], ["bolt11", "lnbc1"]];
+  const receipt = (signer, recipient, description, bolt11 = "lnbc1u1pzaptest") => {
+    const tags = [["p", recipient.pub], ["P", alice.pub], ["bolt11", bolt11]];
     if (description) tags.push(["description", JSON.stringify(description)]);
     return sign(signer, { kind: 9735, tags });
   };
 
-  // Two receipts for the same zap request count once
+  // Two receipts for the same zap request of 100 sats count once
   add(receipt(lnurl, zed, zapRequest));
   add(receipt(lnurl, zed, zapRequest));
   for (let i = 0; i < 2; i++) {
     add(sign(zed, { content: `zed replies ${i}`, tags: [["e", a1.id], ["p", alice.pub]] }));
+  }
+
+  const bigZap = sign(alice, { kind: 9734, tags: [["p", yan.pub], ["amount", "1000000"]] });
+  add(receipt(lnurl, yan, bigZap, "lnbc10u1pzaptest"));
+  add(sign(yan, { content: "yan replies", tags: [["e", a1.id], ["p", alice.pub]] }));
+
+  const zapToMal = sign(alice, { kind: 9734, tags: [["p", mal.pub]] });
+  add(receipt(forger, mal, zapToMal, "lnbc100u1pzaptest"));
+  const wrongAmount = sign(alice, { kind: 9734, tags: [["p", mal.pub], ["amount", "21000"]] });
+  add(receipt(lnurl, mal, wrongAmount, "lnbc100u1pzaptest"));
+  for (let i = 0; i < 2; i++) {
+    add(sign(mal, { content: `mal replies ${i}`, tags: [["e", a1.id], ["p", alice.pub]] }));
   }
 
   add(receipt(forger, forger, null));
@@ -280,6 +323,10 @@ banyan {
     allowPrivateAddresses = true
     replanIntervalSeconds = 2
   }
+
+  signer {
+    relays = "${bunkerUrl}"
+  }
 }
 `,
   );
@@ -297,8 +344,8 @@ async function waitForHttp() {
   throw new Error("relay did not start");
 }
 
-function recompute(person) {
-  const out = strfry(["banyan", "recompute", person]);
+async function recompute(person) {
+  const out = await strfryAsync(["banyan", "recompute", person]);
   const scores = new Map();
   for (const line of out.trim().split("\n")) {
     const [circle, npub, score] = line.split(" ");
@@ -307,8 +354,25 @@ function recompute(person) {
   return { out, scores };
 }
 
-async function testTrustCircles() {
-  const { out, scores } = recompute("alice");
+// Each person's LNURL endpoint, as lud06 points to it: zaps are only genuine when lnurl's key signed the receipt
+function startLnurlServer() {
+  const hits = [];
+  const server = http.createServer((req, res) => {
+    hits.push(req.url);
+    const m = req.url.match(/^\/\.well-known\/lnurlp\/([a-z]+)$/);
+    if (!m) {
+      res.writeHead(404);
+      return res.end();
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ tag: "payRequest", callback: `http://127.0.0.1:${lnurlPort}/cb/${m[1]}`, minSendable: 1000, maxSendable: 1e11, metadata: "[]", allowsNostr: true, nostrPubkey: lnurl.pub }));
+  });
+  server.listen(lnurlPort, "127.0.0.1");
+  return { server, hits };
+}
+
+async function testTrustCircles(lnurlServer) {
+  const { out, scores } = await recompute("alice");
   expect(scores.get(bob.npub)?.circle === "primary", `bob should be primary, got:\n${out}`);
   expect(scores.get(carol.npub)?.circle === "secondary", `carol should be secondary, got:\n${out}`);
   expect(!scores.has(stranger.npub), "a one-sided stranger must not enter the universe");
@@ -316,6 +380,10 @@ async function testTrustCircles() {
   expect(!scores.has(forger.npub), `forged zap receipts must not count, got:\n${out}`);
   expect(scores.get(zed.npub)?.circle === "primary", `a genuine zap counts, got:\n${out}`);
   expect(scores.get(zed.npub).score < 5, `one zap request counts once whatever the number of receipts, got:\n${out}`);
+  expect(lnurlServer.hits.includes("/.well-known/lnurlp/zed"), "the recipient's LNURL server is asked for its nostrPubkey");
+
+  expect(scores.get(yan.npub)?.score > scores.get(zed.npub).score, `a bigger zap weighs more, even with fewer replies, got:\n${out}`);
+  expect(!scores.has(mal.npub), `receipts not signed by the recipient's LNURL server, or with an amount that differs from the request, don't count, got:\n${out}`);
 
   const flood = scores.get(flooder.npub);
   expect(flood && flood.score < scores.get(bob.npub).score, `flooding one direction can't outrank a mutual friend, got:\n${out}`);
@@ -323,16 +391,20 @@ async function testTrustCircles() {
 }
 
 async function testBlockedFreeTheirSlot() {
+  const { scores } = await recompute("alice");
+  const ranked = [...scores].filter(([, m]) => m.circle === "primary").sort((a, b) => b[1].score - a[1].score);
+  expect(ranked[0][0] === bob.npub, "bob is alice's closest peer");
+
   strfry(["banyan", "set", "alice", JSON.stringify({ primaryCircleSize: 1, blocked: [bob.npub] })]);
-  recompute("alice");
+  await recompute("alice");
 
   const shown = JSON.parse(strfry(["banyan", "show", "alice"]));
-  const primary = shown.members.filter((m) => m.circle === "primary").map((m) => m.pubkey);
-  expect(primary.length === 1 && primary[0] === zed.pub, `the next peer takes a blocked member's slot, got ${JSON.stringify(primary)}`);
+  const primary = shown.members.filter((m) => m.circle === "primary").map((m) => m.npub);
+  expect(primary.length === 1 && primary[0] === ranked[1][0], `the next peer takes a blocked member's slot, got ${JSON.stringify(primary)}`);
   expect(!shown.members.some((m) => m.pubkey === carol.pub), "people reached only through a blocked member leave too");
 
   strfry(["banyan", "set", "alice", JSON.stringify({ primaryCircleSize: 50, blocked: [] })]);
-  recompute("alice");
+  await recompute("alice");
   pass("testBlockedFreeTheirSlot");
 }
 
@@ -450,7 +522,7 @@ async function testIncomingEngagement() {
     expect((await a.publish(r))[2] === true, "alice answers");
   }
 
-  const { out, scores } = recompute("alice");
+  const { out, scores } = await recompute("alice");
   expect(scores.get(newcomer.npub)?.circle === "primary", `replies sent only to alice's Banyan count toward trust, got:\n${out}`);
   await until("the newcomer's replies to be served", async () => (await a.req(`v${Date.now()}`, { ids: replies.map((e) => e.id) })).length === 3);
   a.close();
@@ -605,6 +677,48 @@ async function testThreadQueries() {
   pass("testThreadQueries");
 }
 
+async function testMutedThreads() {
+  const c = await connect("alice");
+  const m0 = sign(alice, { content: "a thread alice keeps", created_at: now() });
+  const m1 = sign(bob, { content: "a sub-thread alice mutes", tags: [["e", m0.id], ["p", alice.pub]], created_at: now() });
+  const m2 = sign(carol, { content: "under the muted reply", tags: [["e", m1.id], ["p", bob.pub]], created_at: now() });
+  const m3 = sign(alice, { kind: 7, content: "+", tags: [["e", m2.id], ["p", carol.pub]], created_at: now() });
+  for (const e of [m0, m1, m2, m3]) expect((await c.publish(e))[2] === true, "publish the thread");
+
+  const muted = await rpc(alice, "updatetenant", ["alice", { mutedThreads: [neventEncode({ id: m1.id, relays: ["wss://relay.test"] })] }]);
+  expect(muted.json.result?.settings.mutedThreads[0] === m1.id, `mute a sub-thread by its nevent1: ${JSON.stringify(muted.json).slice(0, 300)}`);
+
+  const visible = await c.req("m1", { ids: [m0, m1, m2, m3].map((e) => e.id) });
+  expect(sameIds(visible, [m0]), `a muted sub-thread is hidden, its parent is not, got ${visible.map((e) => e.content).join(" | ")}`);
+  expect(sameIds(await c.req("m2", { thread: [m0.id] }), [m0]), "thread queries skip a muted sub-thread");
+
+  await c.req("live", { kinds: [1], since: now() - 5 });
+  const m4 = sign(bob, { content: "a late reply in the muted sub-thread", tags: [["e", m2.id], ["p", carol.pub]], created_at: now() });
+  expect((await c.publish(m4))[2] === true, "writes in a muted thread are still accepted");
+  let leaked = false;
+  c.waitFor((m) => m[0] === "EVENT" && m[1] === "live" && m[2].id === m4.id, 1500).then(() => (leaked = true), () => {});
+  await delay(1700);
+  expect(!leaked, "a reply in a muted thread is not sent live");
+
+  await until("the late reply to join the muted set", async () => (await rpc(alice, "gettenant", ["alice"])).json.result.muted.hiddenEvents >= 4);
+  const m5 = sign(carol, { content: "deeper in the muted sub-thread", tags: [["e", m4.id], ["p", bob.pub]], created_at: now() });
+  expect((await c.publish(m5))[2] === true, "publish deeper");
+  expect((await c.req("m5", { ids: [m5.id] })).length === 0, "the muted set grows with the thread");
+
+  // Muting from a client publishes a NIP-51 mute list
+  const n0 = sign(bob, { content: "a thread alice mutes from her client", created_at: now() });
+  expect((await c.publish(n0))[2] === true, "publish another thread");
+  expect((await c.publish(sign(alice, { kind: 10000, tags: [["e", n0.id]], created_at: now() })))[2] === true, "publish the mute list");
+  await until("the mute list to apply", async () => (await c.req(`n${Date.now()}`, { ids: [n0.id] })).length === 0);
+
+  await rpc(alice, "updatetenant", ["alice", { mutedThreads: [] }]);
+  expect((await c.req("m6", { ids: [m1.id, m2.id, m4.id, m5.id] })).length === 4, "unmuting shows the sub-thread again");
+  await c.publish(sign(alice, { kind: 10000, tags: [], created_at: now() + 1 }));
+  await until("the emptied mute list to apply", async () => (await c.req(`u${Date.now()}`, { ids: [n0.id] })).length === 1);
+  c.close();
+  pass("testMutedThreads");
+}
+
 async function testOwnerManagesOwnRelay() {
   const who = await rpc(alice, "whoami");
   expect(who.json.result.isAdmin === false && who.json.result.tenant === "alice", `owner recognised: ${JSON.stringify(who.json)}`);
@@ -642,11 +756,13 @@ function scanIds(filter) {
 
 async function testPrune() {
   const dry = strfry(["banyan", "prune", "--dry-run"]);
-  expect(dry.includes("Would delete 4 "), `dry run: ${dry}`);
+  // The outsider's 4 events that are not trust evidence, and mal's profile
+  expect(dry.includes("Would delete 5 "), `dry run: ${dry}`);
   expect(scanIds({ authors: [outsider.pub] }).size === 4, "a dry run deletes nothing");
 
   const out = strfry(["banyan", "prune"]);
-  expect(out.includes("Deleted 4 "), `prune: ${out}`);
+  expect(out.includes("Deleted 5 "), `prune: ${out}`);
+  expect(scanIds({ authors: [mal.pub], kinds: [0] }).size === 0, "the profile of someone in no universe goes");
 
   const left = scanIds({ authors: [outsider.pub] });
   expect(left.size === 1 && left.has(T.outsiderReply.id), "only trust evidence is left of an outsider");
@@ -661,10 +777,11 @@ async function testPrune() {
 }
 
 // A relay that refuses everything until NIP-42 AUTH, like many paid or private relays
-function startUpstream(stored) {
+function startUpstream(stored, port = upstreamPort) {
+  const url = `ws://127.0.0.1:${port}`;
   const received = [];
   const authed = new Set();
-  const wss = new WebSocketServer({ port: upstreamPort, host: "127.0.0.1" });
+  const wss = new WebSocketServer({ port, host: "127.0.0.1" });
 
   wss.on("connection", (ws) => {
     const challenge = Math.random().toString(36).slice(2);
@@ -680,7 +797,7 @@ function startUpstream(stored) {
       if (type === "AUTH") {
         const ev = rest[0];
         const tag = (n) => (ev.tags.find((t) => t[0] === n) || [])[1];
-        const ok = verifyEvent(ev) && ev.kind === 22242 && tag("challenge") === challenge && tag("relay") === upstreamUrl;
+        const ok = verifyEvent(ev) && ev.kind === 22242 && tag("challenge") === challenge && tag("relay") === url;
         if (ok) {
           pubkey = ev.pubkey;
           authed.add(ev.pubkey);
@@ -711,10 +828,169 @@ function startUpstream(stored) {
   return { wss, received, authed };
 }
 
-async function testHarvesterAuthAndDelivery() {
-  const inbox = (pk) => sign(pk, { kind: 10002, tags: [["r", upstreamUrl]], created_at: now() - 120 });
+// Like NIP-17 inbox relays: each person only reads their own gift wraps, after NIP-42 AUTH as themselves
+function startDmRelay(stored) {
+  const authedAs = [];
+  const wss = new WebSocketServer({ port: dmPort, host: "127.0.0.1" });
+
+  wss.on("connection", (ws) => {
+    const challenge = Math.random().toString(36).slice(2);
+    let pubkey = null;
+    const send = (m) => ws.send(JSON.stringify(m));
+    send(["AUTH", challenge]);
+
+    ws.on("message", (data) => {
+      const [type, ...rest] = JSON.parse(String(data));
+      if (type === "AUTH") {
+        const ev = rest[0];
+        const tag = (n) => (ev.tags.find((t) => t[0] === n) || [])[1];
+        const ok = verifyEvent(ev) && ev.kind === 22242 && tag("challenge") === challenge && tag("relay") === dmUrl;
+        if (ok) {
+          pubkey = ev.pubkey;
+          authedAs.push(ev.pubkey);
+        }
+        send(["OK", ev.id, ok, ok ? "" : "invalid: bad AUTH"]);
+      } else if (type === "REQ") {
+        const [subId, ...filters] = rest;
+        if (!pubkey) return send(["CLOSED", subId, "auth-required: only the recipient reads their messages"]);
+        const mine = stored.filter((e) => e.tags.some((t) => t[0] === "p" && t[1] === pubkey) && matchFilters(filters, e));
+        for (const e of mine) send(["EVENT", subId, e]);
+        send(["EOSE", subId]);
+      } else if (type === "EVENT") {
+        send(["OK", rest[0].id, false, "blocked: read-only"]);
+      }
+    });
+  });
+
+  return { wss, authedAs };
+}
+
+// A relay with a NIP-46 remote signer on it that holds alice's key, like a bunker
+function startBunker(user, secret) {
+  const subs = [];
+  const stored = [];
+  const methods = [];
+  const wss = new WebSocketServer({ port: bunkerPort, host: "127.0.0.1" });
+
+  const broadcast = (ev) => {
+    stored.push(ev);
+    for (const s of subs) {
+      if (s.ws.readyState === 1 && matchFilters(s.filters, ev)) s.ws.send(JSON.stringify(["EVENT", s.subId, ev]));
+    }
+  };
+  const answer = (clientPub, body) => {
+    const ck = getConversationKey(bunkerKey.sec, clientPub);
+    broadcast(sign(bunkerKey, { kind: 24133, tags: [["p", clientPub]], content: nip44Encrypt(JSON.stringify(body), ck), created_at: now() }));
+  };
+
+  wss.on("connection", (ws) => {
+    ws.on("message", (data) => {
+      const [type, ...rest] = JSON.parse(String(data));
+      if (type === "REQ") {
+        const [subId, ...filters] = rest;
+        const existing = subs.find((s) => s.ws === ws && s.subId === subId);
+        if (existing) existing.filters = filters;
+        else subs.push({ ws, subId, filters });
+        for (const e of stored.filter((e) => matchFilters(filters, e))) ws.send(JSON.stringify(["EVENT", subId, e]));
+        ws.send(JSON.stringify(["EOSE", subId]));
+      } else if (type === "EVENT") {
+        const ev = rest[0];
+        ws.send(JSON.stringify(["OK", ev.id, true, ""]));
+        if (ev.kind !== 24133 || !ev.tags.some((t) => t[0] === "p" && t[1] === bunkerKey.pub)) return;
+
+        const req = JSON.parse(nip44Decrypt(ev.content, getConversationKey(bunkerKey.sec, ev.pubkey)));
+        methods.push(req.method);
+        if (req.method === "connect") {
+          answer(ev.pubkey, req.params[1] === secret ? { id: req.id, result: "ack" } : { id: req.id, error: "bad secret" });
+        } else if (req.method === "get_public_key") {
+          answer(ev.pubkey, { id: req.id, result: user.pub });
+        } else if (req.method === "sign_event") {
+          const unsigned = JSON.parse(req.params[0]);
+          answer(ev.pubkey, { id: req.id, result: JSON.stringify(finalizeEvent(unsigned, user.sec)) });
+        }
+      }
+    });
+  });
+
+  // The person pastes the nostrconnect:// link in their signer, which answers with its secret
+  const acceptNostrConnect = (link) => {
+    const u = new URL(link.replace("nostrconnect://", "http://"));
+    answer(u.hostname, { id: Math.random().toString(36).slice(2), result: u.searchParams.get("secret") });
+  };
+
+  return { wss, methods, acceptNostrConnect };
+}
+
+async function testHarvesterAuthAndDelivery(c, upstream, outbox, upstreamNote) {
+  await until("the harvester to fetch past AUTH", async () => (await c.req(`u${Date.now()}`, { ids: [upstreamNote.id] })).length === 1);
+  const status = (await rpc(admin, "harveststatus")).json.result;
+  expect(upstream.authed.has(status.authPubkey), "the harvester authenticated with the key it reports");
+  expect(status.relays.some((r) => r.url === upstreamUrl && r.auth === "ok"), "harveststatus shows the relay as authenticated");
+
+  // Bob's relay list says his inbox is upstream: the reply must reach it
+  await until("bob's relay list", async () => (await c.req(`l${Date.now()}`, { kinds: [10002], authors: [bob.pub] })).length === 1);
+  await delay(3000); // next replan picks up the relay list
+  const reply = sign(alice, { content: "alice to bob, delivered", tags: [["e", T.bob.id], ["p", bob.pub]], created_at: now() });
+  const toDave = sign(alice, { content: "alice to dave, not delivered", tags: [["p", dave.pub]], created_at: now() });
+  expect((await c.publish(reply))[2] === true && (await c.publish(toDave))[2] === true, "publish on /alice");
+
+  await until("the reply in bob's inbox", () => upstream.received.some((e) => e.id === reply.id));
+  await delay(2000);
+  expect(!upstream.received.some((e) => e.id === toDave.id), "people outside the author's universe get nothing");
+  expect(!upstream.received.some((e) => e.id === upstreamNote.id), "events are not sent back where they came from");
+
+  // Alice's own write relay gets everything she publishes on her Banyan, and so does bob's for his
+  await until("alice's note in her outbox", () => outbox.received.some((e) => e.id === toDave.id));
+  const fromBob = sign(bob, { content: "bob posts on alice's Banyan", created_at: now() });
+  expect((await c.publish(fromBob))[2] === true, "bob publishes on /alice");
+  await until("bob's note in his outbox", () => upstream.received.some((e) => e.id === fromBob.id));
+  pass("testHarvesterAuthAndDelivery");
+}
+
+async function testOwnerSigner(c, bunker, dm, outbox, wraps) {
+  const secret = "open-sesame";
+  const link = `bunker://${bunkerKey.pub}?relay=${encodeURIComponent(bunkerUrl)}&secret=${secret}`;
+  const connected = await rpc(alice, "connectsigner", ["alice", link]);
+  expect(connected.json.result?.signerPubkey === bunkerKey.pub, `connectsigner: ${JSON.stringify(connected.json)}`);
+
+  await until("the remote signer to be ready", async () => (await rpc(alice, "gettenant", ["alice"])).json.result.signer?.state === "ready");
+  expect(bunker.methods.includes("connect") && bunker.methods.includes("get_public_key"), `the harvester connected and checked the key: ${bunker.methods}`);
+
+  await until("alice's gift wrap, fetched as alice", () => scanIds({ ids: [wraps.forAlice.id] }).size === 1);
+  expect(dm.authedAs.length > 0 && dm.authedAs.every((pk) => pk === alice.pub), "the DM relay only saw AUTH as alice");
+  expect(bunker.methods.includes("sign_event"), "AUTH was signed by the remote signer");
+  expect(scanIds({ ids: [wraps.forBob.id] }).size === 0, "nobody else's gift wraps");
+
+  await until("alice's session on her write relay", () => outbox.authed.has(alice.pub));
+  const note = sign(alice, { content: "published through alice's own session", created_at: now() });
+  expect((await c.publish(note))[2] === true, "alice publishes");
+  await until("the note in alice's outbox", () => outbox.received.some((e) => e.id === note.id));
+
+  const pending = await rpc(alice, "nostrconnect", ["alice"]);
+  const uri = pending.json.result?.nostrconnect;
+  expect(typeof uri === "string" && uri.includes(encodeURIComponent(bunkerUrl)) && uri.includes("perms=sign_event%3A22242"), `nostrconnect link: ${JSON.stringify(pending.json)}`);
+  bunker.acceptNostrConnect(uri);
+  await until("the nostrconnect signer to be ready", async () => {
+    const s = (await rpc(alice, "gettenant", ["alice"])).json.result.signer;
+    return s?.state === "ready" && s.signerPubkey === bunkerKey.pub && !s.nostrconnect;
+  });
+
+  expect((await rpc(alice, "removesigner", ["alice"])).json.result === null, "removesigner");
+  expect((await rpc(alice, "gettenant", ["alice"])).json.result.signer === null, "no signer left");
+  pass("testOwnerSigner");
+}
+
+async function testHarvester() {
+  const relayList = (pk) => sign(pk, { kind: 10002, tags: [["r", upstreamUrl]], created_at: now() - 120 });
   const upstreamNote = sign(carol, { content: "carol, only upstream", created_at: now() - 60 });
-  const upstream = startUpstream([inbox(bob), inbox(dave), upstreamNote]);
+  const upstream = startUpstream([relayList(bob), relayList(dave), upstreamNote]);
+  const outbox = startUpstream([], outboxPort);
+  const bunker = startBunker(alice, "open-sesame");
+  const wraps = {
+    forAlice: sign(makeKey(), { kind: 1059, content: "sealed for alice", tags: [["p", alice.pub]], created_at: now() - 3600 }),
+    forBob: sign(makeKey(), { kind: 1059, content: "sealed for bob", tags: [["p", bob.pub]], created_at: now() - 3600 }),
+  };
+  const dm = startDmRelay([wraps.forAlice, wraps.forBob]);
 
   writeConfig({ harvester: true });
   const relay = startRelay();
@@ -723,27 +999,18 @@ async function testHarvesterAuthAndDelivery() {
     await waitForHttp();
     const c = await connect("alice");
 
-    await until("the harvester to fetch past AUTH", async () => (await c.req(`u${Date.now()}`, { ids: [upstreamNote.id] })).length === 1);
-    const status = (await rpc(admin, "harveststatus")).json.result;
-    expect(upstream.authed.has(status.authPubkey), "the harvester authenticated with the key it reports");
-    expect(status.relays.some((r) => r.url === upstreamUrl && r.auth === "ok"), "harveststatus shows the relay as authenticated");
+    const aliceLists = [
+      sign(alice, { kind: 10002, tags: [["r", outboxUrl, "write"]], created_at: now() }),
+      sign(alice, { kind: 10050, tags: [["relay", dmUrl]], created_at: now() }),
+    ];
+    for (const e of aliceLists) expect((await c.publish(e))[2] === true, "alice's relay lists");
 
-    // Bob's relay list says his inbox is upstream: the reply must reach it
-    await until("bob's relay list", async () => (await c.req(`l${Date.now()}`, { kinds: [10002], authors: [bob.pub] })).length === 1);
-    await delay(3000); // next replan picks up the relay list
-    const reply = sign(alice, { content: "alice to bob, delivered", tags: [["e", T.bob.id], ["p", bob.pub]], created_at: now() });
-    const toDave = sign(alice, { content: "alice to dave, not delivered", tags: [["p", dave.pub]], created_at: now() });
-    expect((await c.publish(reply))[2] === true && (await c.publish(toDave))[2] === true, "publish on /alice");
-
-    await until("the reply in bob's inbox", () => upstream.received.some((e) => e.id === reply.id));
-    await delay(2000);
-    expect(!upstream.received.some((e) => e.id === toDave.id), "people outside the author's universe get nothing");
-    expect(!upstream.received.some((e) => e.id === upstreamNote.id), "events are not sent back where they came from");
+    await testHarvesterAuthAndDelivery(c, upstream, outbox, upstreamNote);
+    await testOwnerSigner(c, bunker, dm, outbox, wraps);
     c.close();
-    pass("testHarvesterAuthAndDelivery");
   } finally {
     await stopRelay(relay);
-    upstream.wss.close();
+    for (const s of [upstream, outbox, bunker, dm]) s.wss.close();
   }
 }
 
@@ -764,13 +1031,14 @@ async function stopRelay(relay) {
 
 async function main() {
   writeConfig();
+  const lnurlServer = startLnurlServer();
 
   seeded = seedEvents();
   strfry(["import"], seeded.map((e) => JSON.stringify(e)).join("\n") + "\n");
   strfry(["banyan", "add", alice.npub, "alice"]);
   strfry(["banyan", "add", dave.pub, "dave"]);
 
-  await testTrustCircles();
+  await testTrustCircles(lnurlServer);
   await testBlockedFreeTheirSlot();
 
   let relay = startRelay();
@@ -785,17 +1053,19 @@ async function main() {
     await testHttp();
     await testAdminApi();
     await testThreadQueries();
+    await testMutedThreads();
     await testOwnerManagesOwnRelay();
     await testPrune();
     await stopRelay(relay);
     relay = null;
-    await testHarvesterAuthAndDelivery();
+    await testHarvester();
   } catch (e) {
     console.error(e);
     console.error(`\nRelay logs:\n${relayLogs.split("\n").slice(-80).join("\n")}`);
     process.exitCode = 1;
   } finally {
     if (relay) relay.kill("SIGTERM");
+    lnurlServer.server.close();
     writeFileSync(path.join(workDir, "relay.log"), relayLogs);
   }
 }
